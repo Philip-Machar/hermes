@@ -6,7 +6,7 @@ A scalable, fault-tolerant distributed job queue system built with Go, RabbitMQ,
 
 ```
 ┌─────────────┐                     ┌──────────────┐
-│   Client    │─────(HTTP)────────>│  API Server  │
+│   Client    │─────(HTTP)────────> │  API Server  │
 │             │                     │   :8080      │
 └─────────────┘                     └──────────────┘
                                            │
@@ -16,15 +16,15 @@ A scalable, fault-tolerant distributed job queue system built with Go, RabbitMQ,
                                     │ RabbitMQ   │
                                     │ :5672      │
                                     └────────────┘
-                                      ▲  │  ▲
-                             (Consume) │  │  │ (DLQ)
-                                      │  ▼  │
-                        ┌─────────────────┴──────────────┐
+                                       ▲  │   ▲
+                              (Consume)│  │  │ (DLQ)
+                                       │  ▼  │
+                        ┌────────────────-┴──────────────┐
                         │                                │
                    ┌────────┐                      ┌──────────┐
-                   │ Worker │ (gRPC Heartbeat)    │ DLQ Jobs │
-                   │ :50051 │◄────────────────────│          │
-                   │ Node 1 │                     └──────────┘
+                   │ Worker │ (gRPC Heartbeat)     │ DLQ Jobs │
+                   │ :50051 │◄────────────────────-│          │
+                   │ Node 1 │                      └──────────┘
                    └────────┘
                         │
                         ├─ gRPC Heartbeat (every 5s)
