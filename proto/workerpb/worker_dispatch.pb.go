@@ -11,7 +11,6 @@ package workerpb
 
 import (
 	"reflect"
-	"sync"
 	"unsafe"
 
 	"google.golang.org/protobuf/reflect/protoreflect"
@@ -114,20 +113,6 @@ const file_worker_dispatch_proto_rawDesc = "\x0a\x15\x77\x6f\x72\x6b\x65\x72\x5f
 	"\x74\x75\x73\x18\x01\x20\x01\x28\x09\x42\x1b\x5a\x19\x2e\x2f\x70" +
 	"\x72\x6f\x74\x6f\x2f\x77\x6f\x72\x6b\x65\x72\x70\x62\x3b\x77\x6f" +
 	"\x72\x6b\x65\x72\x70\x62\x62\x06\x70\x72\x6f\x74\x6f\x33"
-
-var (
-	file_worker_dispatch_proto_rawDescOnce sync.Once
-	file_worker_dispatch_proto_rawDescData []byte
-)
-
-func file_worker_dispatch_proto_rawDescGZIP() []byte {
-	file_worker_dispatch_proto_rawDescOnce.Do(func() {
-		file_worker_dispatch_proto_rawDescData = protoimpl.X.CompressGZIP(
-			unsafe.Slice(unsafe.StringData(file_worker_dispatch_proto_rawDesc), len(file_worker_dispatch_proto_rawDesc)),
-		)
-	})
-	return file_worker_dispatch_proto_rawDescData
-}
 
 var file_worker_dispatch_proto_msgTypes = make([]protoimpl.MessageInfo, 2)
 
