@@ -17,20 +17,15 @@ JobQueue is a production-grade distributed job queue designed around a **control
 
 ## Screenshots
 
-> _API Server + Worker running side by side_
+> _Real-time worker and job monitoring dashboard_
 
-<!-- Replace with your actual screenshot -->
-![API and Worker terminals](docs/screenshots/terminals.png)
+<!-- Add after dashboard is built -->
+![Dashboard](docs/screenshots/dashboard.png)
 
-> _Direct job dispatch response_
+> _Landing page_
 
-<!-- Replace with your actual screenshot -->
-![curl dispatch](docs/screenshots/dispatch.png)
-
-> _GET /workers live registry snapshot_
-
-<!-- Replace with your actual screenshot -->
-![workers endpoint](docs/screenshots/workers.png)
+<!-- Add after landing page is built -->
+![Landing page](docs/screenshots/landing.png)
 
 ---
 
