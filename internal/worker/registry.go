@@ -1,16 +1,15 @@
 package worker
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
+	"net/http"
 	"sync"
 	"time"
-
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
-
-	"jobqueue/proto/workerpb"
 )
 
 const workerTTL = time.Second * 15
@@ -18,7 +17,7 @@ const workerTTL = time.Second * 15
 type workerInfo struct {
 	LastSeen time.Time
 	Load     int32
-	Address  string // gRPC dispatch address, e.g. "localhost:50052"
+	Address  string // HTTP dispatch address, e.g. "localhost:9001"
 }
 
 type Registry struct {
@@ -66,7 +65,6 @@ func (r *Registry) List() map[string]workerInfo {
 }
 
 // PickWorker returns the ID of the first alive worker, or "" if none.
-// Simple strategy: first entry in the map. No load balancing needed yet.
 func (r *Registry) PickWorker() string {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -77,34 +75,50 @@ func (r *Registry) PickWorker() string {
 	return ""
 }
 
-// GetWorkerConn dials the dispatch gRPC address of the given worker.
-// Returns the client and the underlying connection.
-// Caller must call conn.Close() when done.
-func (r *Registry) GetWorkerConn(id string) (workerpb.WorkerDispatchServiceClient, *grpc.ClientConn, error) {
+// DispatchJob sends a job directly to a worker over HTTP.
+func (r *Registry) DispatchJob(workerID, jobID, jobType string, payload interface{}) error {
 	r.mu.Lock()
-	info, ok := r.workers[id]
+	info, ok := r.workers[workerID]
 	if !ok {
 		r.mu.Unlock()
-		return nil, nil, errors.New("worker not found: " + id)
+		return errors.New("worker not found: " + workerID)
 	}
 	addr := info.Address
 	r.mu.Unlock()
 
 	if addr == "" {
-		return nil, nil, errors.New("worker has no dispatch address registered: " + id)
+		return errors.New("worker has no dispatch address: " + workerID)
 	}
 
-	conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	body, err := json.Marshal(map[string]interface{}{
+		"job_id":   jobID,
+		"job_type": jobType,
+		"payload":  payload,
+	})
 	if err != nil {
-		return nil, nil, err
+		return fmt.Errorf("failed to encode dispatch request: %w", err)
 	}
 
-	return workerpb.NewWorkerDispatchServiceClient(conn), conn, nil
-}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
 
-// DispatchContext returns a context with a 10-second timeout for dispatch calls.
-func DispatchContext() (context.Context, context.CancelFunc) {
-	return context.WithTimeout(context.Background(), 10*time.Second)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://"+addr+"/dispatch", bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("failed to create request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("dispatch request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("worker returned status %d", resp.StatusCode)
+	}
+
+	return nil
 }
 
 func (r *Registry) CleanupExpired() {

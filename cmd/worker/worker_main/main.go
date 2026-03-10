@@ -6,7 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
-	"net"
+	"net/http"
 	"time"
 
 	"github.com/google/uuid"
@@ -22,10 +22,9 @@ import (
 const maxAttempts = 3
 
 func main() {
-
-	// --port lets you run multiple workers locally without port conflicts.
-	// e.g. go run ./cmd/worker/worker_main/main.go --port 50053
-	dispatchPort := flag.Int("port", 50052, "port this worker listens on for direct job dispatch")
+	// --port lets you run multiple workers locally without conflicts.
+	// e.g. go run ./cmd/worker/worker_main/main.go --port 9002
+	dispatchPort := flag.Int("port", 9001, "HTTP port this worker listens on for direct job dispatch")
 	flag.Parse()
 
 	workerID := uuid.NewString()
@@ -46,55 +45,66 @@ func main() {
 	defer rmq.Close()
 
 	// -------------------------------------------------------------------------
-	// Start this worker's own WorkerDispatchService gRPC server.
-	// The API will dial this address to push jobs directly to us.
+	// Start HTTP dispatch server
+	// The API will POST jobs directly to /dispatch on this port.
 	// -------------------------------------------------------------------------
-	lis, err := net.Listen("tcp", fmt.Sprintf(":%d", *dispatchPort))
-	if err != nil {
-		log.Fatalf("failed to listen on port %d: %v", *dispatchPort, err)
-	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/dispatch", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
 
-	dispatchServer := grpc.NewServer()
-	workerpb.RegisterWorkerDispatchServiceServer(dispatchServer, &dispatchHandler{workerID: workerID})
+		var req struct {
+			JobID   string      `json:"job_id"`
+			JobType string      `json:"job_type"`
+			Payload interface{} `json:"payload"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "invalid request: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+
+		log.Printf("[direct] job received: id=%s type=%s", req.JobID, req.JobType)
+		log.Printf("[direct] job %s completed", req.JobID)
+
+		w.WriteHeader(http.StatusOK)
+	})
 
 	go func() {
-		log.Printf("WorkerDispatchService listening on :%d", *dispatchPort)
-		if err := dispatchServer.Serve(lis); err != nil {
-			log.Fatalf("dispatch gRPC server error: %v", err)
+		log.Printf("HTTP dispatch server listening on :%d", *dispatchPort)
+		if err := http.ListenAndServe(fmt.Sprintf(":%d", *dispatchPort), mux); err != nil {
+			log.Fatalf("dispatch server error: %v", err)
 		}
 	}()
 
 	// -------------------------------------------------------------------------
-	// Connect to the API's WorkerService gRPC server at :50051
+	// Connect to API gRPC server and register
 	// -------------------------------------------------------------------------
 	conn, err := grpc.NewClient(
 		"localhost:50051",
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 	)
 	if err != nil {
-		log.Fatalf("failed to connect to API gRPC server: %v", err)
+		log.Fatalf("failed to connect to API gRPC: %v", err)
 	}
 	defer conn.Close()
 
 	apiClient := workerpb.NewWorkerServiceClient(conn)
 
-	// -------------------------------------------------------------------------
-	// Register with the API.
-	// Format: "<uuid>@<dispatch-address>" so the API stores our address.
-	// -------------------------------------------------------------------------
+	// Register as "<uuid>@<dispatch-address>" so the API knows where to reach us
 	registrationID := fmt.Sprintf("%s@%s", workerID, dispatchAddr)
 	_, err = apiClient.Register(
 		context.Background(),
 		&workerpb.RegisterRequest{WorkerId: registrationID},
 	)
 	if err != nil {
-		log.Fatalf("failed to register with API: %v", err)
+		log.Fatalf("failed to register: %v", err)
 	}
-	log.Printf("Worker registered | id=%s | dispatch=%s", workerID, dispatchAddr)
+	log.Printf("Worker registered | id=%s | dispatch=http://%s", workerID, dispatchAddr)
 
 	// -------------------------------------------------------------------------
-	// Heartbeat loop — sends load status every 5 seconds.
-	// Uses plain workerID (no address) because the API already stored the address.
+	// Heartbeat loop
 	// -------------------------------------------------------------------------
 	var currentLoad int32 = 0
 
@@ -119,7 +129,7 @@ func main() {
 	}()
 
 	// -------------------------------------------------------------------------
-	// RabbitMQ consumer — handles jobs that were queued as fallback
+	// RabbitMQ consumer — handles queued (fallback) jobs
 	// -------------------------------------------------------------------------
 	if err := rmq.Channel().Qos(1, 0, false); err != nil {
 		log.Fatalf("failed to set QoS: %v", err)
@@ -127,8 +137,8 @@ func main() {
 
 	msgs, err := rmq.Channel().Consume(
 		cfg.QueueName,
-		"",    // auto-generated consumer tag
-		false, // manual ack
+		"",
+		false,
 		false,
 		false,
 		false,
@@ -146,31 +156,6 @@ func main() {
 		currentLoad = 0
 	}
 }
-
-// -------------------------------------------------------------------------
-// WorkerDispatchService implementation
-// Receives jobs pushed directly from the API via gRPC.
-// -------------------------------------------------------------------------
-
-type dispatchHandler struct {
-	workerpb.UnimplementedWorkerDispatchServiceServer
-	workerID string
-}
-
-func (h *dispatchHandler) DispatchJob(ctx context.Context, req *workerpb.DispatchRequest) (*workerpb.DispatchResponse, error) {
-	log.Printf("[direct] job received: id=%s type=%s", req.JobId, req.JobType)
-
-	// Execute the job
-	log.Printf("[direct] executing job %s", req.JobId)
-	// Real work goes here. Currently: log and succeed immediately.
-	log.Printf("[direct] job %s completed", req.JobId)
-
-	return &workerpb.DispatchResponse{Status: "ok"}, nil
-}
-
-// -------------------------------------------------------------------------
-// RabbitMQ message handler — processes queued (fallback) jobs
-// -------------------------------------------------------------------------
 
 func handleMessage(msg amqp.Delivery, rmq *queue.RabbitMQ) {
 	var job jobs.Job

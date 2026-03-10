@@ -33,7 +33,7 @@ func main() {
 	defer rmq.Close()
 
 	// -------------------------------------------------------------------------
-	// Worker Registry (in-memory)
+	// Worker Registry
 	// -------------------------------------------------------------------------
 	reg := worker.NewRegistry()
 
@@ -45,7 +45,7 @@ func main() {
 	}()
 
 	// -------------------------------------------------------------------------
-	// gRPC server — workers connect here to Register and send Heartbeats
+	// gRPC server — workers connect here to Register and Heartbeat
 	// -------------------------------------------------------------------------
 	lis, err := net.Listen("tcp", ":50051")
 	if err != nil {
@@ -69,14 +69,11 @@ func main() {
 	mux.HandleFunc("/workers", handleGetWorkers(reg))
 	mux.HandleFunc("/jobs", handlePostJob(reg, rmq))
 
-	log.Println("API listening on :8080...")
-	log.Fatal(http.ListenAndServe(":8080", mux))
+	log.Println("API listening on :8081...")
+	log.Fatal(http.ListenAndServe(":8081", mux))
 }
 
-// -------------------------------------------------------------------------
-// GET /workers
-// Returns a JSON list of all alive workers with their ID, load, and status.
-// -------------------------------------------------------------------------
+// GET /workers — returns all alive workers as JSON
 func handleGetWorkers(reg *worker.Registry) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
@@ -115,11 +112,7 @@ func handleGetWorkers(reg *worker.Registry) http.HandlerFunc {
 	}
 }
 
-// -------------------------------------------------------------------------
-// POST /jobs
-// Picks an alive worker and dispatches the job directly via gRPC.
-// Falls back to RabbitMQ if no workers are available or dispatch fails.
-// -------------------------------------------------------------------------
+// POST /jobs — dispatches directly to a worker over HTTP, falls back to RabbitMQ
 func handlePostJob(reg *worker.Registry, rmq *queue.RabbitMQ) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
@@ -155,32 +148,15 @@ func handlePostJob(reg *worker.Registry, rmq *queue.RabbitMQ) http.HandlerFunc {
 			return
 		}
 
-		// Dial the chosen worker's WorkerDispatchService
-		dispatchClient, conn, err := reg.GetWorkerConn(workerID)
+		// Dispatch directly to the worker over HTTP
+		err := reg.DispatchJob(workerID, job.ID, job.Type, job.Payload)
 		if err != nil {
-			log.Printf("could not dial worker %s: %v — queuing job %s", workerID, err, job.ID)
+			log.Printf("dispatch to worker %s failed: %v — queuing job %s", workerID, err, job.ID)
 			enqueueToRabbitMQ(w, job, rmq, "worker unreachable, job queued")
 			return
 		}
-		defer conn.Close()
 
-		payloadBytes, _ := json.Marshal(job.Payload)
-
-		ctx, cancel := worker.DispatchContext()
-		defer cancel()
-
-		resp, err := dispatchClient.DispatchJob(ctx, &workerpb.DispatchRequest{
-			JobId:   job.ID,
-			JobType: job.Type,
-			Payload: string(payloadBytes),
-		})
-		if err != nil {
-			log.Printf("dispatch to worker %s failed: %v — queuing job %s", workerID, err, job.ID)
-			enqueueToRabbitMQ(w, job, rmq, "dispatch failed, job queued")
-			return
-		}
-
-		log.Printf("job %s dispatched directly to worker %s: %s", job.ID, workerID, resp.Status)
+		log.Printf("job %s dispatched directly to worker %s", job.ID, workerID)
 
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusAccepted)
@@ -188,12 +164,10 @@ func handlePostJob(reg *worker.Registry, rmq *queue.RabbitMQ) http.HandlerFunc {
 			"job":       job,
 			"routed":    "direct",
 			"worker_id": workerID,
-			"status":    resp.Status,
 		})
 	}
 }
 
-// enqueueToRabbitMQ serialises the job and publishes it to RabbitMQ.
 func enqueueToRabbitMQ(w http.ResponseWriter, job jobs.Job, rmq *queue.RabbitMQ, note string) {
 	data, err := json.Marshal(job)
 	if err != nil {
