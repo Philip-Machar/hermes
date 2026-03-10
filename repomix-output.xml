@@ -1,0 +1,1934 @@
+This file is a merged representation of the entire codebase, combined into a single document by Repomix.
+
+<file_summary>
+This section contains a summary of this file.
+
+<purpose>
+This file contains a packed representation of the entire repository's contents.
+It is designed to be easily consumable by AI systems for analysis, code review,
+or other automated processes.
+</purpose>
+
+<file_format>
+The content is organized as follows:
+1. This summary section
+2. Repository information
+3. Directory structure
+4. Repository files (if enabled)
+5. Multiple file entries, each consisting of:
+  - File path as an attribute
+  - Full contents of the file
+</file_format>
+
+<usage_guidelines>
+- This file should be treated as read-only. Any changes should be made to the
+  original repository files, not this packed version.
+- When processing this file, use the file path to distinguish
+  between different files in the repository.
+- Be aware that this file may contain sensitive information. Handle it with
+  the same level of security as you would the original repository.
+</usage_guidelines>
+
+<notes>
+- Some files may have been excluded based on .gitignore rules and Repomix's configuration
+- Binary files are not included in this packed representation. Please refer to the Repository Structure section for a complete list of file paths, including binary files
+- Files matching patterns in .gitignore are excluded
+- Files matching default ignore patterns are excluded
+- Files are sorted by Git change count (files with more changes are at the bottom)
+</notes>
+
+</file_summary>
+
+<directory_structure>
+cmd/
+  api/
+    main.go
+  worker/
+    dlq_consumer/
+      main.go
+    worker_main/
+      main.go
+internal/
+  jobs/
+    job.go
+  queue/
+    config.go
+    queue.go
+    rabbitmq.go
+  worker/
+    grpc_server.go
+    registry.go
+proto/
+  workerpb/
+    worker_grpc.pb.go
+    worker.pb.go
+  worker.proto
+scripts/
+  consumer/
+    consume.go
+  publisher/
+    publish.go
+docker-compose.yml
+go.mod
+README.md
+</directory_structure>
+
+<files>
+This section contains the contents of the repository's files.
+
+<file path="cmd/worker/dlq_consumer/main.go">
+package main
+
+import (
+	"encoding/json"
+	"log"
+
+	amqp "github.com/rabbitmq/amqp091-go"
+)
+
+type DeadJob struct {
+	ID       string `json:"id"`
+	Attempts int    `json:"attempts"`
+	Payload  any    `json:"payload"`
+}
+
+func main() {
+	conn, err := amqp.Dial("amqp://guest:guest@localhost:5672/")
+	if err != nil {
+		log.Fatal("DLQ connect failed:", err)
+	}
+	defer conn.Close()
+
+	ch, err := conn.Channel()
+	if err != nil {
+		log.Fatal("DLQ channel failed:", err)
+	}
+	defer ch.Close()
+
+	msgs, err := ch.Consume(
+		"jobs.dlq",
+		"dlq-consumer",
+		false,
+		false,
+		false,
+		false,
+		nil,
+	)
+	if err != nil {
+		log.Fatal("DLQ consume failed:", err)
+	}
+
+	log.Println("DLQ consumer running")
+
+	for msg := range msgs {
+		var job DeadJob
+		if err := json.Unmarshal(msg.Body, &job); err != nil {
+			log.Println("Invalid DLQ message:", err)
+			msg.Ack(false)
+			continue
+		}
+
+		log.Printf(
+			"DEAD JOB: id=%s attempts=%d payload=%v",
+			job.ID,
+			job.Attempts,
+			job.Payload,
+		)
+
+		// Ack so it doesn't loop forever
+		msg.Ack(false)
+	}
+}
+</file>
+
+<file path="internal/queue/config.go">
+package queue
+
+type Config struct {
+	URL       string
+	QueueName string
+}
+</file>
+
+<file path="internal/queue/queue.go">
+package queue
+
+type Queue interface {
+	Publish(body []byte) error
+	Close() error
+}
+</file>
+
+<file path="docker-compose.yml">
+version: "3.9"
+
+services:
+  rabbitmq:
+    image: rabbitmq:3.13-management
+    container_name: jobqueue-rabbitmq
+    ports:
+      - "5672:5672"     # AMQP (your Go apps use this)
+      - "15672:15672"   # Web UI
+    environment:
+      RABBITMQ_DEFAULT_USER: guest
+      RABBITMQ_DEFAULT_PASS: guest
+</file>
+
+<file path="README.md">
+# JobQueue - Distributed Job Processing System
+
+A scalable, fault-tolerant distributed job queue system built with Go, RabbitMQ, and gRPC. This system allows you to submit jobs from a central API and have them processed by a fleet of worker nodes with automatic retry logic and dead-letter queue handling.
+
+## Architecture
+
+```
+┌─────────────┐                     ┌──────────────┐
+│   Client    │─────(HTTP)────────>│  API Server  │
+│             │                     │   :8080      │
+└─────────────┘                     └──────────────┘
+                                           │
+                              (JSON Jobs)  │
+                                           ▼
+                                    ┌────────────┐
+                                    │ RabbitMQ   │
+                                    │ :5672      │
+                                    └────────────┘
+                                      ▲  │  ▲
+                             (Consume) │  │  │ (DLQ)
+                                      │  ▼  │
+                        ┌─────────────────┴──────────────┐
+                        │                                │
+                   ┌────────┐                      ┌──────────┐
+                   │ Worker │ (gRPC Heartbeat)    │ DLQ Jobs │
+                   │ :50051 │◄────────────────────│          │
+                   │ Node 1 │                     └──────────┘
+                   └────────┘
+                        │
+                        ├─ gRPC Heartbeat (every 5s)
+                        │
+                   ┌────────┐
+                   │ Worker │
+                   │ Node 2 │
+                   └────────┘
+                        │
+                        ├─ Processes Jobs
+                        │
+                        └─ Retries on Failure (3 attempts)
+```
+
+## Features
+
+### Core Functionality
+- **Job Submission**: Submit jobs via HTTP REST API with arbitrary payload
+- **Distributed Processing**: Multiple worker nodes process jobs concurrently
+- **Automatic Retries**: Failed jobs automatically retry (up to 3 attempts) before going to DLQ
+- **Dead Letter Queue**: Failed jobs after max retries are moved to a DLQ for analysis
+- **Worker Health Tracking**: Workers register with the API and send heartbeats every 5 seconds
+
+### Reliability
+- **Persistent Queues**: All jobs persisted in RabbitMQ
+- **Worker Registry**: In-memory registry tracks all active workers with automatic cleanup
+- **Load Awareness**: Workers report their load status (idle/busy) to enable load balancing
+- **gRPC Communication**: Efficient binary protocol for worker-to-API communication
+
+## Tech Stack
+
+- **Language**: Go 1.21+
+- **Message Queue**: RabbitMQ 3.x (AMQP 0.9.1)
+- **RPC Framework**: gRPC with Protocol Buffers
+- **Containerization**: Docker & Docker Compose
+
+## Quick Start
+
+### Prerequisites
+
+- Docker & Docker Compose
+- Go 1.21+
+
+### 1. Start RabbitMQ
+
+```bash
+docker-compose up -d
+```
+
+Verify RabbitMQ is running:
+```bash
+docker-compose ps
+```
+
+### 2. Start the API Server
+
+In a new terminal:
+```bash
+go run ./cmd/api/main.go
+```
+
+You should see:
+```
+gRPC server listening on :50051...
+Job API listening on :8080...
+```
+
+### 3. Start Worker Node(s)
+
+In another terminal:
+```bash
+go run ./cmd/worker/worker_main/main.go
+```
+
+You should see:
+```
+Worker registered with ID: <uuid>
+Worker started and consuming jobs
+heartbeat sent (load=0)
+heartbeat sent (load=0)
+...
+```
+
+### 4. Submit a Job
+
+In yet another terminal:
+```bash
+curl -X POST http://localhost:8080/jobs \
+  -H "Content-Type: application/json" \
+  -d '{"type":"email","payload":{"to":"user@example.com","subject":"Hello"}}'
+```
+
+You'll get a response like:
+```json
+{
+  "id": "550e8400-e29b-41d4-a716-446655440000",
+  "type": "email",
+  "payload": {"to": "user@example.com", "subject": "Hello"},
+  "attempts": 0
+}
+```
+
+The worker will process the job and log:
+```
+processing job 550e8400-e29b-41d4-a716-446655440000 (type=email, attempt=0)
+job 550e8400-e29b-41d4-a716-446655440000 succeeded
+```
+
+## API Endpoints
+
+### Submit a Job
+**POST** `/jobs`
+
+Request body:
+```json
+{
+  "type": "string",           // Job type identifier
+  "payload": {}              // Arbitrary job payload
+}
+```
+
+Response (202 Accepted):
+```json
+{
+  "id": "uuid",              // Unique job ID
+  "type": "string",
+  "payload": {},
+  "attempts": 0              // Attempt count
+}
+```
+
+## gRPC Service
+
+The API exposes a `WorkerService` on `:50051` for worker coordination.
+
+### WorkerService API
+
+#### Register
+Registers a new worker with the control plane.
+- **Request**: `RegisterRequest{worker_id: string}`
+- **Response**: `RegisterResponse{status: string}`
+
+#### Heartbeat
+Sends periodic health checks from worker to API.
+- **Request**: `HeartbeatRequest{worker_id: string, load: int32}`
+- **Response**: `HeartbeatResponse{status: string}`
+- **Interval**: Every 5 seconds per worker
+- **Load Values**: 0 = idle, 1 = busy processing
+
+#### ListWorkers
+Retrieves list of all active workers.
+- **Request**: `Empty{}`
+- **Response**: `WorkerList{workers: map[string]Timestamp]}`
+
+## Job Processing Flow
+
+```
+1. Client submits job via HTTP POST /jobs
+                    ↓
+2. API Server validates & publishes to RabbitMQ "jobs" queue
+                    ↓
+3. Worker consumes message from queue
+                    ↓
+4. Job processing:
+   - Unmarshal JSON payload
+   - Simulate processing (demo: always succeeds on 3rd attempt)
+   - If failed (attempts < 3):
+     * Re-marshal job with incremented attempts
+     * Nack original message
+     * Re-publish to jobs queue
+   - If succeeded:
+     * Ack message (remove from queue)
+```
+
+## Retry Logic
+
+Jobs are retried automatically up to **3 total attempts**:
+
+- **Attempt 0**: Initial processing → Fails → Re-queue
+- **Attempt 1**: Second try → Fails → Re-queue  
+- **Attempt 2**: Third try → Succeeds (or goes to DLQ)
+
+Failed jobs after 3 attempts move to the **Dead Letter Queue (DLQ)** for manual inspection.
+
+## Worker Health Management
+
+### Registration
+When a worker starts, it:
+1. Connects to API gRPC server
+2. Calls `Register(worker_id)`
+3. Enters heartbeat loop
+
+### Heartbeat Cycle
+Every 5 seconds, workers send:
+- Current `worker_id`
+- Current `load` status (0=idle, 1=busy)
+
+### Cleanup
+The API periodically (every 5 seconds) removes workers that haven't sent a heartbeat for **15 seconds**.
+
+## Project Structure
+
+```
+jobqueue/
+├── cmd/
+│   ├── api/
+│   │   └── main.go              # API server (HTTP + gRPC)
+│   └── worker/
+│       ├── worker_main/
+│       │   └── main.go          # Worker node
+│       └── dlq_consumer/
+│           └── main.go          # Dead-letter queue consumer (optional)
+├── internal/
+│   ├── jobs/
+│   │   └── job.go               # Job data structure
+│   ├── queue/
+│   │   ├── config.go            # RabbitMQ config
+│   │   ├── queue.go             # Queue interface
+│   │   └── rabbitmq.go          # RabbitMQ implementation
+│   └── worker/
+│       ├── registry.go          # Worker registry (in-memory)
+│       └── grpc_server.go       # gRPC service handler
+├── proto/
+│   ├── worker.proto             # Protocol Buffer definitions
+│   └── workerpb/
+│       ├── worker.pb.go         # Generated message code
+│       └── worker_grpc.pb.go    # Generated gRPC code
+├── docker-compose.yml           # Local development setup
+├── go.mod & go.sum              # Go dependencies
+└── README.md                    # This file
+```
+
+## Configuration
+
+### RabbitMQ Connection
+Edit the URL in `cmd/api/main.go` and `cmd/worker/worker_main/main.go`:
+```go
+cfg := queue.Config{
+    URL:       "amqp://guest:guest@localhost:5672/",
+    QueueName: "jobs",
+}
+```
+
+### Worker Heartbeat Interval
+Edit `cmd/worker/worker_main/main.go`:
+```go
+ticker := time.NewTicker(5 * time.Second)  // Change to desired interval
+```
+
+### Worker TTL (Time To Live)
+Edit `internal/worker/registry.go`:
+```go
+const workerTTL = time.Second * 15  // Workers removed after 15s of no heartbeat
+```
+
+## Development
+
+### Generate Protocol Buffers
+
+If you modify `proto/worker.proto`, regenerate the Go code:
+
+```bash
+protoc --go_out=. --go-grpc_out=. proto/worker.proto
+```
+
+### Run Tests
+
+```bash
+go test ./...
+```
+
+### View RabbitMQ Management UI
+
+Open http://localhost:15672 in your browser
+- Username: `guest`
+- Password: `guest`
+
+You can inspect queues, messages, and dead-letter exchanges here.
+
+## Troubleshooting
+
+### Worker hangs on startup
+**Symptom**: Worker prints registration message but no heartbeats.
+
+**Solution**: Ensure API server is running on `:50051` and RabbitMQ is accessible.
+
+### Jobs not processing
+**Symptom**: Jobs published but workers don't consume them.
+
+**Solution**: 
+1. Check RabbitMQ is running: `docker-compose ps`
+2. Verify queue name matches in both API and Worker configs
+3. Check worker logs for connection errors
+
+### High memory usage
+**Symptom**: Registry grows unbounded.
+
+**Solution**: The cleanup goroutine removes inactive workers every 5 seconds. Ensure no worker is permanently stuck.
+
+## Performance Considerations
+
+- **Concurrency**: Set QoS in worker to process multiple jobs in parallel (currently set to 1)
+- **Scaling**: Add more worker nodes by running additional instances
+- **Monitoring**: Expose worker registry via HTTP endpoint for metrics/dashboards
+- **Persistence**: Currently uses in-memory registry; consider Redis for distributed deployments
+
+## Future Enhancements
+
+- [ ] Distributed worker registry (Redis/etcd)
+- [ ] Job progress tracking and status updates
+- [ ] Priority queues for job types
+- [ ] Worker autoscaling based on queue depth
+- [ ] Comprehensive metrics and observability (Prometheus)
+- [ ] Job scheduling and cron support
+- [ ] Web dashboard for job monitoring
+
+## License
+
+MIT
+
+## Author
+
+Built by Philip Machar
+</file>
+
+<file path="internal/jobs/job.go">
+package jobs
+
+type Job struct {
+	ID       string      `json:"id"`
+	Type     string      `json:"type"`
+	Payload  interface{} `json:"payload"`
+	Attempts int         `json:"attempts"`
+}
+</file>
+
+<file path="internal/worker/grpc_server.go">
+package worker
+
+import (
+	"context"
+	"log"
+
+	"jobqueue/proto/workerpb"
+)
+
+type GRPCServer struct {
+	registry *Registry
+	workerpb.UnimplementedWorkerServiceServer
+}
+
+func NewGRPCServer(reg *Registry) *GRPCServer {
+	return &GRPCServer{registry: reg}
+}
+
+func (s *GRPCServer) Register(ctx context.Context, req *workerpb.RegisterRequest) (*workerpb.RegisterResponse, error) {
+	log.Printf("worker registered: %s", req.WorkerId)
+	s.registry.Register(req.WorkerId)
+
+	return &workerpb.RegisterResponse{Status: "ok"}, nil
+}
+
+func (s *GRPCServer) Heartbeat(ctx context.Context, req *workerpb.HeartbeatRequest) (*workerpb.HeartbeatResponse, error) {
+	s.registry.UpdateLoad(req.WorkerId, req.Load)
+	return &workerpb.HeartbeatResponse{Status: "alive"}, nil
+}
+
+func (s *GRPCServer) ListWorkers(ctx context.Context, _ *workerpb.Empty) (*workerpb.WorkerList, error) {
+	snapshot := s.registry.List()
+
+	resp := &workerpb.WorkerList{}
+
+	for id, info := range snapshot {
+		resp.Workers = append(resp.Workers, &workerpb.Worker{
+			WorkerId:     id,
+			LastSeenUnix: info.LastSeen.Unix(),
+			Load:         info.Load,
+		})
+	}
+
+	return resp, nil
+}
+</file>
+
+<file path="proto/workerpb/worker_grpc.pb.go">
+// Code generated by protoc-gen-go-grpc. DO NOT EDIT.
+// versions:
+// - protoc-gen-go-grpc v1.6.1
+// - protoc             v6.33.4
+// source: proto/worker.proto
+
+package workerpb
+
+import (
+	context "context"
+	grpc "google.golang.org/grpc"
+	codes "google.golang.org/grpc/codes"
+	status "google.golang.org/grpc/status"
+)
+
+// This is a compile-time assertion to ensure that this generated file
+// is compatible with the grpc package it is being compiled against.
+// Requires gRPC-Go v1.64.0 or later.
+const _ = grpc.SupportPackageIsVersion9
+
+const (
+	WorkerService_Register_FullMethodName    = "/worker.WorkerService/Register"
+	WorkerService_Heartbeat_FullMethodName   = "/worker.WorkerService/Heartbeat"
+	WorkerService_ListWorkers_FullMethodName = "/worker.WorkerService/ListWorkers"
+)
+
+// WorkerServiceClient is the client API for WorkerService service.
+//
+// For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
+type WorkerServiceClient interface {
+	Register(ctx context.Context, in *RegisterRequest, opts ...grpc.CallOption) (*RegisterResponse, error)
+	Heartbeat(ctx context.Context, in *HeartbeatRequest, opts ...grpc.CallOption) (*HeartbeatResponse, error)
+	ListWorkers(ctx context.Context, in *Empty, opts ...grpc.CallOption) (*WorkerList, error)
+}
+
+type workerServiceClient struct {
+	cc grpc.ClientConnInterface
+}
+
+func NewWorkerServiceClient(cc grpc.ClientConnInterface) WorkerServiceClient {
+	return &workerServiceClient{cc}
+}
+
+func (c *workerServiceClient) Register(ctx context.Context, in *RegisterRequest, opts ...grpc.CallOption) (*RegisterResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(RegisterResponse)
+	err := c.cc.Invoke(ctx, WorkerService_Register_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *workerServiceClient) Heartbeat(ctx context.Context, in *HeartbeatRequest, opts ...grpc.CallOption) (*HeartbeatResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(HeartbeatResponse)
+	err := c.cc.Invoke(ctx, WorkerService_Heartbeat_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *workerServiceClient) ListWorkers(ctx context.Context, in *Empty, opts ...grpc.CallOption) (*WorkerList, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(WorkerList)
+	err := c.cc.Invoke(ctx, WorkerService_ListWorkers_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// WorkerServiceServer is the server API for WorkerService service.
+// All implementations must embed UnimplementedWorkerServiceServer
+// for forward compatibility.
+type WorkerServiceServer interface {
+	Register(context.Context, *RegisterRequest) (*RegisterResponse, error)
+	Heartbeat(context.Context, *HeartbeatRequest) (*HeartbeatResponse, error)
+	ListWorkers(context.Context, *Empty) (*WorkerList, error)
+	mustEmbedUnimplementedWorkerServiceServer()
+}
+
+// UnimplementedWorkerServiceServer must be embedded to have
+// forward compatible implementations.
+//
+// NOTE: this should be embedded by value instead of pointer to avoid a nil
+// pointer dereference when methods are called.
+type UnimplementedWorkerServiceServer struct{}
+
+func (UnimplementedWorkerServiceServer) Register(context.Context, *RegisterRequest) (*RegisterResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method Register not implemented")
+}
+func (UnimplementedWorkerServiceServer) Heartbeat(context.Context, *HeartbeatRequest) (*HeartbeatResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method Heartbeat not implemented")
+}
+func (UnimplementedWorkerServiceServer) ListWorkers(context.Context, *Empty) (*WorkerList, error) {
+	return nil, status.Error(codes.Unimplemented, "method ListWorkers not implemented")
+}
+func (UnimplementedWorkerServiceServer) mustEmbedUnimplementedWorkerServiceServer() {}
+func (UnimplementedWorkerServiceServer) testEmbeddedByValue()                       {}
+
+// UnsafeWorkerServiceServer may be embedded to opt out of forward compatibility for this service.
+// Use of this interface is not recommended, as added methods to WorkerServiceServer will
+// result in compilation errors.
+type UnsafeWorkerServiceServer interface {
+	mustEmbedUnimplementedWorkerServiceServer()
+}
+
+func RegisterWorkerServiceServer(s grpc.ServiceRegistrar, srv WorkerServiceServer) {
+	// If the following call panics, it indicates UnimplementedWorkerServiceServer was
+	// embedded by pointer and is nil.  This will cause panics if an
+	// unimplemented method is ever invoked, so we test this at initialization
+	// time to prevent it from happening at runtime later due to I/O.
+	if t, ok := srv.(interface{ testEmbeddedByValue() }); ok {
+		t.testEmbeddedByValue()
+	}
+	s.RegisterService(&WorkerService_ServiceDesc, srv)
+}
+
+func _WorkerService_Register_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(RegisterRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(WorkerServiceServer).Register(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: WorkerService_Register_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(WorkerServiceServer).Register(ctx, req.(*RegisterRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _WorkerService_Heartbeat_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(HeartbeatRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(WorkerServiceServer).Heartbeat(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: WorkerService_Heartbeat_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(WorkerServiceServer).Heartbeat(ctx, req.(*HeartbeatRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _WorkerService_ListWorkers_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(Empty)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(WorkerServiceServer).ListWorkers(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: WorkerService_ListWorkers_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(WorkerServiceServer).ListWorkers(ctx, req.(*Empty))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+// WorkerService_ServiceDesc is the grpc.ServiceDesc for WorkerService service.
+// It's only intended for direct use with grpc.RegisterService,
+// and not to be introspected or modified (even as a copy)
+var WorkerService_ServiceDesc = grpc.ServiceDesc{
+	ServiceName: "worker.WorkerService",
+	HandlerType: (*WorkerServiceServer)(nil),
+	Methods: []grpc.MethodDesc{
+		{
+			MethodName: "Register",
+			Handler:    _WorkerService_Register_Handler,
+		},
+		{
+			MethodName: "Heartbeat",
+			Handler:    _WorkerService_Heartbeat_Handler,
+		},
+		{
+			MethodName: "ListWorkers",
+			Handler:    _WorkerService_ListWorkers_Handler,
+		},
+	},
+	Streams:  []grpc.StreamDesc{},
+	Metadata: "proto/worker.proto",
+}
+</file>
+
+<file path="proto/workerpb/worker.pb.go">
+// Code generated by protoc-gen-go. DO NOT EDIT.
+// versions:
+// 	protoc-gen-go v1.36.11
+// 	protoc        v6.33.4
+// source: proto/worker.proto
+
+package workerpb
+
+import (
+	protoreflect "google.golang.org/protobuf/reflect/protoreflect"
+	protoimpl "google.golang.org/protobuf/runtime/protoimpl"
+	reflect "reflect"
+	sync "sync"
+	unsafe "unsafe"
+)
+
+const (
+	// Verify that this generated code is sufficiently up-to-date.
+	_ = protoimpl.EnforceVersion(20 - protoimpl.MinVersion)
+	// Verify that runtime/protoimpl is sufficiently up-to-date.
+	_ = protoimpl.EnforceVersion(protoimpl.MaxVersion - 20)
+)
+
+type RegisterRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	WorkerId      string                 `protobuf:"bytes,1,opt,name=worker_id,json=workerId,proto3" json:"worker_id,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *RegisterRequest) Reset() {
+	*x = RegisterRequest{}
+	mi := &file_proto_worker_proto_msgTypes[0]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *RegisterRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*RegisterRequest) ProtoMessage() {}
+
+func (x *RegisterRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_worker_proto_msgTypes[0]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use RegisterRequest.ProtoReflect.Descriptor instead.
+func (*RegisterRequest) Descriptor() ([]byte, []int) {
+	return file_proto_worker_proto_rawDescGZIP(), []int{0}
+}
+
+func (x *RegisterRequest) GetWorkerId() string {
+	if x != nil {
+		return x.WorkerId
+	}
+	return ""
+}
+
+type RegisterResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Status        string                 `protobuf:"bytes,1,opt,name=status,proto3" json:"status,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *RegisterResponse) Reset() {
+	*x = RegisterResponse{}
+	mi := &file_proto_worker_proto_msgTypes[1]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *RegisterResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*RegisterResponse) ProtoMessage() {}
+
+func (x *RegisterResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_worker_proto_msgTypes[1]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use RegisterResponse.ProtoReflect.Descriptor instead.
+func (*RegisterResponse) Descriptor() ([]byte, []int) {
+	return file_proto_worker_proto_rawDescGZIP(), []int{1}
+}
+
+func (x *RegisterResponse) GetStatus() string {
+	if x != nil {
+		return x.Status
+	}
+	return ""
+}
+
+type HeartbeatRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	WorkerId      string                 `protobuf:"bytes,1,opt,name=worker_id,json=workerId,proto3" json:"worker_id,omitempty"`
+	Load          int32                  `protobuf:"varint,2,opt,name=load,proto3" json:"load,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *HeartbeatRequest) Reset() {
+	*x = HeartbeatRequest{}
+	mi := &file_proto_worker_proto_msgTypes[2]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *HeartbeatRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*HeartbeatRequest) ProtoMessage() {}
+
+func (x *HeartbeatRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_worker_proto_msgTypes[2]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use HeartbeatRequest.ProtoReflect.Descriptor instead.
+func (*HeartbeatRequest) Descriptor() ([]byte, []int) {
+	return file_proto_worker_proto_rawDescGZIP(), []int{2}
+}
+
+func (x *HeartbeatRequest) GetWorkerId() string {
+	if x != nil {
+		return x.WorkerId
+	}
+	return ""
+}
+
+func (x *HeartbeatRequest) GetLoad() int32 {
+	if x != nil {
+		return x.Load
+	}
+	return 0
+}
+
+type HeartbeatResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Status        string                 `protobuf:"bytes,1,opt,name=status,proto3" json:"status,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *HeartbeatResponse) Reset() {
+	*x = HeartbeatResponse{}
+	mi := &file_proto_worker_proto_msgTypes[3]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *HeartbeatResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*HeartbeatResponse) ProtoMessage() {}
+
+func (x *HeartbeatResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_worker_proto_msgTypes[3]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use HeartbeatResponse.ProtoReflect.Descriptor instead.
+func (*HeartbeatResponse) Descriptor() ([]byte, []int) {
+	return file_proto_worker_proto_rawDescGZIP(), []int{3}
+}
+
+func (x *HeartbeatResponse) GetStatus() string {
+	if x != nil {
+		return x.Status
+	}
+	return ""
+}
+
+type Empty struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *Empty) Reset() {
+	*x = Empty{}
+	mi := &file_proto_worker_proto_msgTypes[4]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *Empty) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*Empty) ProtoMessage() {}
+
+func (x *Empty) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_worker_proto_msgTypes[4]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use Empty.ProtoReflect.Descriptor instead.
+func (*Empty) Descriptor() ([]byte, []int) {
+	return file_proto_worker_proto_rawDescGZIP(), []int{4}
+}
+
+type Worker struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	WorkerId      string                 `protobuf:"bytes,1,opt,name=worker_id,json=workerId,proto3" json:"worker_id,omitempty"`
+	LastSeenUnix  int64                  `protobuf:"varint,2,opt,name=last_seen_unix,json=lastSeenUnix,proto3" json:"last_seen_unix,omitempty"`
+	Load          int32                  `protobuf:"varint,3,opt,name=load,proto3" json:"load,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *Worker) Reset() {
+	*x = Worker{}
+	mi := &file_proto_worker_proto_msgTypes[5]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *Worker) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*Worker) ProtoMessage() {}
+
+func (x *Worker) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_worker_proto_msgTypes[5]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use Worker.ProtoReflect.Descriptor instead.
+func (*Worker) Descriptor() ([]byte, []int) {
+	return file_proto_worker_proto_rawDescGZIP(), []int{5}
+}
+
+func (x *Worker) GetWorkerId() string {
+	if x != nil {
+		return x.WorkerId
+	}
+	return ""
+}
+
+func (x *Worker) GetLastSeenUnix() int64 {
+	if x != nil {
+		return x.LastSeenUnix
+	}
+	return 0
+}
+
+func (x *Worker) GetLoad() int32 {
+	if x != nil {
+		return x.Load
+	}
+	return 0
+}
+
+type WorkerList struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Workers       []*Worker              `protobuf:"bytes,1,rep,name=workers,proto3" json:"workers,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *WorkerList) Reset() {
+	*x = WorkerList{}
+	mi := &file_proto_worker_proto_msgTypes[6]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *WorkerList) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*WorkerList) ProtoMessage() {}
+
+func (x *WorkerList) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_worker_proto_msgTypes[6]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use WorkerList.ProtoReflect.Descriptor instead.
+func (*WorkerList) Descriptor() ([]byte, []int) {
+	return file_proto_worker_proto_rawDescGZIP(), []int{6}
+}
+
+func (x *WorkerList) GetWorkers() []*Worker {
+	if x != nil {
+		return x.Workers
+	}
+	return nil
+}
+
+var File_proto_worker_proto protoreflect.FileDescriptor
+
+const file_proto_worker_proto_rawDesc = "" +
+	"\n" +
+	"\x12proto/worker.proto\x12\x06worker\".\n" +
+	"\x0fRegisterRequest\x12\x1b\n" +
+	"\tworker_id\x18\x01 \x01(\tR\bworkerId\"*\n" +
+	"\x10RegisterResponse\x12\x16\n" +
+	"\x06status\x18\x01 \x01(\tR\x06status\"C\n" +
+	"\x10HeartbeatRequest\x12\x1b\n" +
+	"\tworker_id\x18\x01 \x01(\tR\bworkerId\x12\x12\n" +
+	"\x04load\x18\x02 \x01(\x05R\x04load\"+\n" +
+	"\x11HeartbeatResponse\x12\x16\n" +
+	"\x06status\x18\x01 \x01(\tR\x06status\"\a\n" +
+	"\x05Empty\"_\n" +
+	"\x06Worker\x12\x1b\n" +
+	"\tworker_id\x18\x01 \x01(\tR\bworkerId\x12$\n" +
+	"\x0elast_seen_unix\x18\x02 \x01(\x03R\flastSeenUnix\x12\x12\n" +
+	"\x04load\x18\x03 \x01(\x05R\x04load\"6\n" +
+	"\n" +
+	"WorkerList\x12(\n" +
+	"\aworkers\x18\x01 \x03(\v2\x0e.worker.WorkerR\aworkers2\xc2\x01\n" +
+	"\rWorkerService\x12=\n" +
+	"\bRegister\x12\x17.worker.RegisterRequest\x1a\x18.worker.RegisterResponse\x12@\n" +
+	"\tHeartbeat\x12\x18.worker.HeartbeatRequest\x1a\x19.worker.HeartbeatResponse\x120\n" +
+	"\vListWorkers\x12\r.worker.Empty\x1a\x12.worker.WorkerListB\x1bZ\x19./proto/workerpb;workerpbb\x06proto3"
+
+var (
+	file_proto_worker_proto_rawDescOnce sync.Once
+	file_proto_worker_proto_rawDescData []byte
+)
+
+func file_proto_worker_proto_rawDescGZIP() []byte {
+	file_proto_worker_proto_rawDescOnce.Do(func() {
+		file_proto_worker_proto_rawDescData = protoimpl.X.CompressGZIP(unsafe.Slice(unsafe.StringData(file_proto_worker_proto_rawDesc), len(file_proto_worker_proto_rawDesc)))
+	})
+	return file_proto_worker_proto_rawDescData
+}
+
+var file_proto_worker_proto_msgTypes = make([]protoimpl.MessageInfo, 7)
+var file_proto_worker_proto_goTypes = []any{
+	(*RegisterRequest)(nil),   // 0: worker.RegisterRequest
+	(*RegisterResponse)(nil),  // 1: worker.RegisterResponse
+	(*HeartbeatRequest)(nil),  // 2: worker.HeartbeatRequest
+	(*HeartbeatResponse)(nil), // 3: worker.HeartbeatResponse
+	(*Empty)(nil),             // 4: worker.Empty
+	(*Worker)(nil),            // 5: worker.Worker
+	(*WorkerList)(nil),        // 6: worker.WorkerList
+}
+var file_proto_worker_proto_depIdxs = []int32{
+	5, // 0: worker.WorkerList.workers:type_name -> worker.Worker
+	0, // 1: worker.WorkerService.Register:input_type -> worker.RegisterRequest
+	2, // 2: worker.WorkerService.Heartbeat:input_type -> worker.HeartbeatRequest
+	4, // 3: worker.WorkerService.ListWorkers:input_type -> worker.Empty
+	1, // 4: worker.WorkerService.Register:output_type -> worker.RegisterResponse
+	3, // 5: worker.WorkerService.Heartbeat:output_type -> worker.HeartbeatResponse
+	6, // 6: worker.WorkerService.ListWorkers:output_type -> worker.WorkerList
+	4, // [4:7] is the sub-list for method output_type
+	1, // [1:4] is the sub-list for method input_type
+	1, // [1:1] is the sub-list for extension type_name
+	1, // [1:1] is the sub-list for extension extendee
+	0, // [0:1] is the sub-list for field type_name
+}
+
+func init() { file_proto_worker_proto_init() }
+func file_proto_worker_proto_init() {
+	if File_proto_worker_proto != nil {
+		return
+	}
+	type x struct{}
+	out := protoimpl.TypeBuilder{
+		File: protoimpl.DescBuilder{
+			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
+			RawDescriptor: unsafe.Slice(unsafe.StringData(file_proto_worker_proto_rawDesc), len(file_proto_worker_proto_rawDesc)),
+			NumEnums:      0,
+			NumMessages:   7,
+			NumExtensions: 0,
+			NumServices:   1,
+		},
+		GoTypes:           file_proto_worker_proto_goTypes,
+		DependencyIndexes: file_proto_worker_proto_depIdxs,
+		MessageInfos:      file_proto_worker_proto_msgTypes,
+	}.Build()
+	File_proto_worker_proto = out.File
+	file_proto_worker_proto_goTypes = nil
+	file_proto_worker_proto_depIdxs = nil
+}
+</file>
+
+<file path="scripts/publisher/publish.go">
+package main
+
+import (
+	"log"
+
+	amqp "github.com/rabbitmq/amqp091-go"
+)
+
+func main() {
+	// 1. Connect to RabbitMQ
+	conn, err := amqp.Dial("amqp://guest:guest@localhost:5672/")
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer conn.Close()
+
+	// 2. Open a channel (lightweight connection)
+	ch, err := conn.Channel()
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer ch.Close()
+
+	// 3. Declare a queue
+	q, err := ch.QueueDeclare(
+		"jobs", // queue name
+		true,   // durable (survives broker restart)
+		false,
+		false,
+		false,
+		nil,
+	)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	// 4. Job message (JSON)
+	body := `{"id":"job-1","type":"email","attempt":1}`
+
+	// 5. Publish the job
+	err = ch.Publish(
+		"", // default exchange
+		q.Name,
+		false,
+		false,
+		amqp.Publishing{
+			ContentType: "application/json",
+			Body:        []byte(body),
+		},
+	)
+
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	log.Println("job published")
+}
+</file>
+
+<file path="internal/worker/registry.go">
+package worker
+
+import (
+	"log"
+	"sync"
+	"time"
+)
+
+const workerTTL = time.Second * 15
+
+type workerInfo struct {
+	LastSeen time.Time
+	Load     int32
+}
+
+type Registry struct {
+	mu      sync.Mutex
+	workers map[string]*workerInfo
+}
+
+func NewRegistry() *Registry {
+	return &Registry{
+		workers: make(map[string]*workerInfo),
+	}
+}
+
+func (r *Registry) Register(id string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.workers[id] = &workerInfo{LastSeen: time.Now(), Load: 0}
+}
+
+func (r *Registry) Heartbeat(id string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if w, ok := r.workers[id]; ok {
+		w.LastSeen = time.Now()
+	}
+}
+
+func (r *Registry) UpdateLoad(id string, load int32) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if w, ok := r.workers[id]; ok {
+		w.Load = load
+		w.LastSeen = time.Now()
+	}
+}
+
+func (r *Registry) List() map[string]workerInfo {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	copy := make(map[string]workerInfo)
+
+	for id, info := range r.workers {
+		copy[id] = *info
+	}
+	return copy
+}
+
+func (r *Registry) CleanupExpired() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	now := time.Now()
+	for id, info := range r.workers {
+		if now.Sub(info.LastSeen) > workerTTL {
+			log.Printf("Worker %s expired — removing", id)
+			delete(r.workers, id)
+		}
+	}
+}
+</file>
+
+<file path="proto/worker.proto">
+syntax = "proto3";
+
+package worker;
+
+option go_package = "./proto/workerpb;workerpb";
+
+service WorkerService {
+  rpc Register(RegisterRequest) returns (RegisterResponse);
+  rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+  rpc ListWorkers(Empty) returns (WorkerList);
+}
+
+message RegisterRequest {
+  string worker_id = 1;
+}
+
+message RegisterResponse {
+  string status = 1;
+}
+
+message HeartbeatRequest {
+  string worker_id = 1;
+  int32 load = 2;
+}
+
+message HeartbeatResponse {
+  string status = 1;
+}
+
+message Empty {}
+
+message Worker {
+  string worker_id = 1;
+  int64 last_seen_unix = 2;
+  int32 load = 3;
+}
+
+message WorkerList {
+  repeated Worker workers = 1;
+}
+</file>
+
+<file path="scripts/consumer/consume.go">
+package main
+
+import (
+	"encoding/json"
+	"log"
+
+	amqp "github.com/rabbitmq/amqp091-go"
+
+	"jobqueue/internal/jobs"
+	"jobqueue/internal/queue"
+)
+
+const maxAttempts = 3
+
+func main() {
+	cfg := queue.Config{
+		URL:       "amqp://guest:guest@localhost:5672/",
+		QueueName: "jobs",
+	}
+
+	rmq, err := queue.NewRabbitMQ(&cfg)
+	if err != nil {
+		log.Fatalf("failed to connect to rabbitmq: %v", err)
+	}
+	defer rmq.Close()
+
+	msgs, err := rmq.Channel().Consume(
+		cfg.QueueName,
+		"",
+		false,
+		false,
+		false,
+		false,
+		nil,
+	)
+	if err != nil {
+		log.Fatalf("failed to consume messages: %v", err)
+	}
+
+	for msg := range msgs {
+		handleMessage(msg, rmq)
+	}
+}
+
+func handleMessage(msg amqp.Delivery, rmq *queue.RabbitMQ) {
+	var job jobs.Job
+
+	if err := json.Unmarshal(msg.Body, &job); err != nil {
+		log.Println("invalid job payload, discarded")
+		_ = msg.Nack(false, false)
+		return
+	}
+
+	log.Printf(
+		"processing job %s (type=%s, attempt=%d)",
+		job.ID,
+		job.Type,
+		job.Attempts,
+	)
+
+	// Simulated failure logic
+	if job.Attempts < maxAttempts-1 {
+		job.Attempts++
+
+		log.Printf(
+			"job %s failed, retrying (%d/%d)",
+			job.ID,
+			job.Attempts,
+			maxAttempts,
+		)
+
+		data, err := json.Marshal(job)
+		if err != nil {
+			log.Println("failed to re-marshal job, discarding")
+			_ = msg.Nack(false, false)
+			return
+		}
+
+		// Discard original message
+		_ = msg.Nack(false, false)
+
+		// Re-enqueue updated job
+		if err := rmq.Publish(data); err != nil {
+			log.Println("failed to re-publish job:", err)
+		}
+
+		return
+	}
+
+	// Success path
+	log.Printf("job %s succeeded", job.ID)
+	_ = msg.Ack(false)
+}
+</file>
+
+<file path="cmd/api/main.go">
+package main
+
+import (
+	"encoding/json"
+	"log"
+	"net"
+	"net/http"
+	"time"
+
+	"jobqueue/internal/jobs"
+	"jobqueue/internal/queue"
+	"jobqueue/internal/worker"
+	"jobqueue/proto/workerpb"
+
+	"github.com/google/uuid"
+	"google.golang.org/grpc"
+)
+
+func main() {
+
+	// -----------------------------
+	// RabbitMQ Publisher Setup
+	// -----------------------------
+	cfg := queue.Config{
+		URL:       "amqp://guest:guest@localhost:5672/",
+		QueueName: "jobs",
+	}
+
+	rmq, err := queue.NewRabbitMQ(&cfg)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer rmq.Close()
+
+	// -----------------------------
+	// Worker Registry (in-memory)
+	// -----------------------------
+	reg := worker.NewRegistry()
+
+	//registry cleanup
+	go func() {
+		ticker := time.NewTicker(time.Second * 5)
+
+		for range ticker.C {
+			reg.CleanupExpired()
+		}
+	}()
+
+	// -----------------------------
+	// gRPC Server Setup (for workers)
+	// -----------------------------
+	lis, err := net.Listen("tcp", ":50051")
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	grpcServer := grpc.NewServer()
+	workerpb.RegisterWorkerServiceServer(grpcServer, worker.NewGRPCServer(reg))
+
+	go func() {
+		log.Println("gRPC server listening on :50051...")
+		if err := grpcServer.Serve(lis); err != nil {
+			log.Fatal(err)
+		}
+	}()
+
+	// -----------------------------
+	// HTTP Server (for job submission)
+	// -----------------------------
+	http.HandleFunc("/jobs", func(w http.ResponseWriter, r *http.Request) {
+
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		var req struct {
+			Type    string      `json:"type"`
+			Payload interface{} `json:"payload"`
+		}
+
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid request body: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+
+		job := jobs.Job{
+			ID:      uuid.NewString(),
+			Type:    req.Type,
+			Payload: req.Payload,
+		}
+
+		data, err := json.Marshal(job)
+		if err != nil {
+			http.Error(w, "Failed to encode job: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		if err := rmq.Publish(data); err != nil {
+			http.Error(w, "Failed to enqueue job: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusAccepted)
+		json.NewEncoder(w).Encode(job)
+	})
+
+	log.Println("Job API listening on :8080...")
+	log.Fatal(http.ListenAndServe(":8080", nil))
+}
+</file>
+
+<file path="internal/queue/rabbitmq.go">
+package queue
+
+import (
+	amqp "github.com/rabbitmq/amqp091-go"
+)
+
+type RabbitMQ struct {
+	conn  *amqp.Connection
+	ch    *amqp.Channel
+	queue string
+}
+
+// RabbitMQ constructor
+func NewRabbitMQ(cfg *Config) (*RabbitMQ, error) {
+	conn, err := amqp.Dial(cfg.URL)
+	if err != nil {
+		return nil, err
+	}
+
+	ch, err := conn.Channel()
+	if err != nil {
+		conn.Close()
+		return nil, err
+	}
+
+	// Dead-letter exchange
+	err = ch.ExchangeDeclare(
+		"jobs.dlx",
+		"direct",
+		true,
+		false,
+		false,
+		false,
+		nil,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	// Dead-letter queue
+	dlq, err := ch.QueueDeclare(
+		"jobs.dlq",
+		true,
+		false,
+		false,
+		false,
+		nil,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	// Bind DLQ to DLX
+	err = ch.QueueBind(
+		dlq.Name,
+		"jobs.dlq",
+		"jobs.dlx",
+		false,
+		nil,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	// Main queue with DLQ config
+	args := amqp.Table{
+		"x-dead-letter-exchange":    "jobs.dlx",
+		"x-dead-letter-routing-key": "jobs.dlq",
+	}
+
+	_, err = ch.QueueDeclare(
+		cfg.QueueName, // "jobs"
+		true,
+		false,
+		false,
+		false,
+		args,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	return &RabbitMQ{
+		conn:  conn,
+		ch:    ch,
+		queue: cfg.QueueName,
+	}, nil
+}
+
+func (r *RabbitMQ) Channel() *amqp.Channel {
+	return r.ch
+}
+
+func (r *RabbitMQ) Publish(body []byte) error {
+	return r.ch.Publish(
+		"",
+		r.queue,
+		false,
+		false,
+		amqp.Publishing{
+			ContentType: "application/json",
+			Body:        body,
+		},
+	)
+}
+
+func (r *RabbitMQ) Close() error {
+	if err := r.ch.Close(); err != nil {
+		return err
+	}
+	return r.conn.Close()
+}
+</file>
+
+<file path="go.mod">
+module jobqueue
+
+go 1.24.5
+
+require github.com/rabbitmq/amqp091-go v1.10.0
+
+require (
+	github.com/google/uuid v1.6.0
+	google.golang.org/grpc v1.78.0
+	google.golang.org/protobuf v1.36.11
+)
+
+require (
+	golang.org/x/net v0.47.0 // indirect
+	golang.org/x/sys v0.38.0 // indirect
+	golang.org/x/text v0.31.0 // indirect
+	google.golang.org/genproto/googleapis/rpc v0.0.0-20251029180050-ab9386a59fda // indirect
+)
+</file>
+
+<file path="cmd/worker/worker_main/main.go">
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"log"
+	"time"
+
+	"github.com/google/uuid"
+	amqp "github.com/rabbitmq/amqp091-go"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
+
+	"jobqueue/internal/jobs"
+	"jobqueue/internal/queue"
+	"jobqueue/proto/workerpb"
+)
+
+const maxAttempts = 3
+
+func main() {
+
+	// -----------------------------------
+	// Worker load state (0 = idle, 1 = busy)
+	// -----------------------------------
+	var currentLoad int32 = 0
+
+	// -----------------------------------
+	// Connect to RabbitMQ
+	// -----------------------------------
+	cfg := queue.Config{
+		URL:       "amqp://guest:guest@localhost:5672/",
+		QueueName: "jobs",
+	}
+
+	rmq, err := queue.NewRabbitMQ(&cfg)
+	if err != nil {
+		log.Fatalf("failed to connect to rabbitmq: %v", err)
+	}
+	defer rmq.Close()
+
+	// -----------------------------------
+	// Connect to API via gRPC
+	// -----------------------------------
+	conn, err := grpc.NewClient(
+		"localhost:50051",
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+	)
+	if err != nil {
+		log.Fatalf("failed to connect to API gRPC server: %v", err)
+	}
+	defer conn.Close()
+
+	client := workerpb.NewWorkerServiceClient(conn)
+
+	workerID := uuid.NewString()
+
+	// -----------------------------------
+	// Register worker
+	// -----------------------------------
+	_, err = client.Register(
+		context.Background(),
+		&workerpb.RegisterRequest{WorkerId: workerID},
+	)
+	if err != nil {
+		log.Fatalf("failed to register worker: %v", err)
+	}
+
+	log.Printf("Worker registered with ID: %s", workerID)
+
+	// -----------------------------------
+	// Start Heartbeat Loop (includes load)
+	// -----------------------------------
+	go func() {
+		ticker := time.NewTicker(5 * time.Second)
+		defer ticker.Stop()
+
+		for range ticker.C {
+			_, err := client.Heartbeat(
+				context.Background(),
+				&workerpb.HeartbeatRequest{
+					WorkerId: workerID,
+					Load:     currentLoad,
+				},
+			)
+			if err != nil {
+				log.Println("heartbeat failed:", err)
+				continue
+			}
+			log.Printf("heartbeat sent (load=%d)", currentLoad)
+		}
+	}()
+
+	// -----------------------------------
+	// RabbitMQ Consumer Setup
+	// -----------------------------------
+	if err := rmq.Channel().Qos(1, 0, false); err != nil {
+		log.Fatalf("Failed to set Qos %v", err)
+	}
+
+	msgs, err := rmq.Channel().Consume(
+		cfg.QueueName,
+		"",
+		false,
+		false,
+		false,
+		false,
+		nil,
+	)
+	if err != nil {
+		log.Fatalf("failed to consume messages: %v", err)
+	}
+
+	log.Println("Worker started and consuming jobs")
+	log.Println("Waiting for job messages...")
+
+	for msg := range msgs {
+		log.Println("Received message from queue")
+
+		// Worker becomes busy
+		currentLoad = 1
+
+		handleMessage(msg, rmq)
+
+		// Worker becomes idle
+		currentLoad = 0
+	}
+}
+
+func handleMessage(msg amqp.Delivery, rmq *queue.RabbitMQ) {
+	var job jobs.Job
+
+	if err := json.Unmarshal(msg.Body, &job); err != nil {
+		log.Println("invalid job payload, discarded")
+		_ = msg.Nack(false, false)
+		return
+	}
+
+	log.Printf(
+		"processing job %s (type=%s, attempt=%d)",
+		job.ID,
+		job.Type,
+		job.Attempts,
+	)
+
+	// -----------------------------------
+	// Simulated failure logic
+	// -----------------------------------
+	if job.Attempts < maxAttempts-1 {
+		job.Attempts++
+
+		log.Printf(
+			"job %s failed, retrying (%d/%d)",
+			job.ID,
+			job.Attempts,
+			maxAttempts,
+		)
+
+		data, err := json.Marshal(job)
+		if err != nil {
+			log.Println("failed to re-marshal job, discarding")
+			_ = msg.Nack(false, false)
+			return
+		}
+
+		// discard original message
+		_ = msg.Nack(false, false)
+
+		// re-enqueue
+		if err := rmq.Publish(data); err != nil {
+			log.Println("failed to re-publish job:", err)
+		}
+		return
+	}
+
+	log.Printf("job %s succeeded", job.ID)
+	_ = msg.Ack(false)
+}
+</file>
+
+</files>
