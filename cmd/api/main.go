@@ -18,9 +18,9 @@ import (
 
 func main() {
 
-	// -----------------------------
-	// RabbitMQ Publisher Setup
-	// -----------------------------
+	// -------------------------------------------------------------------------
+	// RabbitMQ — fallback when no alive workers are available
+	// -------------------------------------------------------------------------
 	cfg := queue.Config{
 		URL:       "amqp://guest:guest@localhost:5672/",
 		QueueName: "jobs",
@@ -28,30 +28,28 @@ func main() {
 
 	rmq, err := queue.NewRabbitMQ(&cfg)
 	if err != nil {
-		log.Fatal(err)
+		log.Fatal("RabbitMQ connect failed:", err)
 	}
 	defer rmq.Close()
 
-	// -----------------------------
+	// -------------------------------------------------------------------------
 	// Worker Registry (in-memory)
-	// -----------------------------
+	// -------------------------------------------------------------------------
 	reg := worker.NewRegistry()
 
-	//registry cleanup
 	go func() {
-		ticker := time.NewTicker(time.Second * 5)
-
+		ticker := time.NewTicker(5 * time.Second)
 		for range ticker.C {
 			reg.CleanupExpired()
 		}
 	}()
 
-	// -----------------------------
-	// gRPC Server Setup (for workers)
-	// -----------------------------
+	// -------------------------------------------------------------------------
+	// gRPC server — workers connect here to Register and send Heartbeats
+	// -------------------------------------------------------------------------
 	lis, err := net.Listen("tcp", ":50051")
 	if err != nil {
-		log.Fatal(err)
+		log.Fatal("gRPC listen failed:", err)
 	}
 
 	grpcServer := grpc.NewServer()
@@ -60,17 +58,72 @@ func main() {
 	go func() {
 		log.Println("gRPC server listening on :50051...")
 		if err := grpcServer.Serve(lis); err != nil {
-			log.Fatal(err)
+			log.Fatal("gRPC server error:", err)
 		}
 	}()
 
-	// -----------------------------
-	// HTTP Server (for job submission)
-	// -----------------------------
-	http.HandleFunc("/jobs", func(w http.ResponseWriter, r *http.Request) {
+	// -------------------------------------------------------------------------
+	// HTTP routes
+	// -------------------------------------------------------------------------
+	mux := http.NewServeMux()
+	mux.HandleFunc("/workers", handleGetWorkers(reg))
+	mux.HandleFunc("/jobs", handlePostJob(reg, rmq))
 
+	log.Println("API listening on :8080...")
+	log.Fatal(http.ListenAndServe(":8080", mux))
+}
+
+// -------------------------------------------------------------------------
+// GET /workers
+// Returns a JSON list of all alive workers with their ID, load, and status.
+// -------------------------------------------------------------------------
+func handleGetWorkers(reg *worker.Registry) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		snapshot := reg.List()
+
+		type workerJSON struct {
+			WorkerID string `json:"worker_id"`
+			LastSeen int64  `json:"last_seen_unix"`
+			Load     int32  `json:"load"`
+			Status   string `json:"status"`
+		}
+
+		list := make([]workerJSON, 0, len(snapshot))
+		for id, info := range snapshot {
+			status := "idle"
+			if info.Load > 0 {
+				status = "busy"
+			}
+			list = append(list, workerJSON{
+				WorkerID: id,
+				LastSeen: info.LastSeen.Unix(),
+				Load:     info.Load,
+				Status:   status,
+			})
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"count":   len(list),
+			"workers": list,
+		})
+	}
+}
+
+// -------------------------------------------------------------------------
+// POST /jobs
+// Picks an alive worker and dispatches the job directly via gRPC.
+// Falls back to RabbitMQ if no workers are available or dispatch fails.
+// -------------------------------------------------------------------------
+func handlePostJob(reg *worker.Registry, rmq *queue.RabbitMQ) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
 
@@ -78,9 +131,12 @@ func main() {
 			Type    string      `json:"type"`
 			Payload interface{} `json:"payload"`
 		}
-
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			http.Error(w, "Invalid request body: "+err.Error(), http.StatusBadRequest)
+			http.Error(w, "invalid request body: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+		if req.Type == "" {
+			http.Error(w, "field 'type' is required", http.StatusBadRequest)
 			return
 		}
 
@@ -90,22 +146,69 @@ func main() {
 			Payload: req.Payload,
 		}
 
-		data, err := json.Marshal(job)
-		if err != nil {
-			http.Error(w, "Failed to encode job: "+err.Error(), http.StatusInternalServerError)
+		workerID := reg.PickWorker()
+
+		// No alive workers — fall back to RabbitMQ
+		if workerID == "" {
+			log.Printf("no alive workers — queuing job %s", job.ID)
+			enqueueToRabbitMQ(w, job, rmq, "no alive workers, job queued")
 			return
 		}
 
-		if err := rmq.Publish(data); err != nil {
-			http.Error(w, "Failed to enqueue job: "+err.Error(), http.StatusInternalServerError)
+		// Dial the chosen worker's WorkerDispatchService
+		dispatchClient, conn, err := reg.GetWorkerConn(workerID)
+		if err != nil {
+			log.Printf("could not dial worker %s: %v — queuing job %s", workerID, err, job.ID)
+			enqueueToRabbitMQ(w, job, rmq, "worker unreachable, job queued")
 			return
 		}
+		defer conn.Close()
+
+		payloadBytes, _ := json.Marshal(job.Payload)
+
+		ctx, cancel := worker.DispatchContext()
+		defer cancel()
+
+		resp, err := dispatchClient.DispatchJob(ctx, &workerpb.DispatchRequest{
+			JobId:   job.ID,
+			JobType: job.Type,
+			Payload: string(payloadBytes),
+		})
+		if err != nil {
+			log.Printf("dispatch to worker %s failed: %v — queuing job %s", workerID, err, job.ID)
+			enqueueToRabbitMQ(w, job, rmq, "dispatch failed, job queued")
+			return
+		}
+
+		log.Printf("job %s dispatched directly to worker %s: %s", job.ID, workerID, resp.Status)
 
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusAccepted)
-		json.NewEncoder(w).Encode(job)
-	})
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"job":       job,
+			"routed":    "direct",
+			"worker_id": workerID,
+			"status":    resp.Status,
+		})
+	}
+}
 
-	log.Println("Job API listening on :8080...")
-	log.Fatal(http.ListenAndServe(":8080", nil))
+// enqueueToRabbitMQ serialises the job and publishes it to RabbitMQ.
+func enqueueToRabbitMQ(w http.ResponseWriter, job jobs.Job, rmq *queue.RabbitMQ, note string) {
+	data, err := json.Marshal(job)
+	if err != nil {
+		http.Error(w, "failed to encode job: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if err := rmq.Publish(data); err != nil {
+		http.Error(w, "failed to enqueue job: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusAccepted)
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"job":    job,
+		"routed": "queue",
+		"note":   note,
+	})
 }
