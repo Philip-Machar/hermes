@@ -1,4 +1,4 @@
-# JobQueue
+# Hermes
 
 A distributed job processing system built with Go, featuring a gRPC control plane, direct HTTP job dispatch, RabbitMQ-backed reliability, and a real-time worker registry.
 
@@ -11,7 +11,7 @@ A distributed job processing system built with Go, featuring a gRPC control plan
 
 ## Overview
 
-JobQueue is a production-grade distributed job queue designed around a **control plane / data plane** separation. Workers self-register via gRPC, send continuous heartbeats, and receive jobs either through direct HTTP dispatch or via a durable RabbitMQ queue as a fallback. The system is built to be operationally simple — no external coordination service required.
+Hermes is a production-grade distributed job queue designed around a **control plane / data plane** separation. Workers self-register via gRPC, send continuous heartbeats, and receive jobs either through direct HTTP dispatch or via a durable RabbitMQ queue as a fallback. The system is built to be operationally simple — no external coordination service required.
 
 ---
 
@@ -122,7 +122,7 @@ Every worker also consumes from RabbitMQ. Jobs that enter the queue are retried 
 ## Project Structure
 
 ```
-jobqueue/
+Hermes/
 ├── cmd/
 │   ├── api/
 │   │   └── main.go              # API server — HTTP + gRPC
@@ -354,11 +354,11 @@ startup
    │                                                         │
    └─ RabbitMQ consumer loop                                 │
            │                                                 │
-           ├─ job arrives ──► process ──► Ack               │
+           ├─ job arrives ──► process ──► Ack                │
            │                                                 │
            └─ job fails ──► increment attempts               │
                    │                                         │
-                   ├─ attempts < 3 ──► Nack + re-publish    │
+                   ├─ attempts < 3 ──► Nack + re-publish     │
                    │                                         │
                    └─ attempts == 3 ──► DLQ                  │
                                                              │
