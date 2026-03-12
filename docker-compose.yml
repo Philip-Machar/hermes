@@ -1,12 +1,50 @@
 version: "3.9"
 
 services:
+
   rabbitmq:
     image: rabbitmq:3.13-management
     container_name: jobqueue-rabbitmq
     ports:
-      - "5672:5672"     # AMQP (your Go apps use this)
-      - "15672:15672"   # Web UI
+      - "5672:5672"
+      - "15672:15672"
     environment:
       RABBITMQ_DEFAULT_USER: guest
       RABBITMQ_DEFAULT_PASS: guest
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  api:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.api
+    container_name: jobqueue-api
+    ports:
+      - "8081:8081"
+      - "50051:50051"
+    environment:
+      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
+      RABBITMQ_QUEUE: jobs
+      API_HTTP_PORT: 8081
+      API_GRPC_PORT: 50051
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+
+  worker:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.worker
+    container_name: jobqueue-worker
+    ports:
+      - "9001:9001"
+    environment:
+      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
+      RABBITMQ_QUEUE: jobs
+      API_GRPC_ADDR: api:50051
+      WORKER_DISPATCH_PORT: 9001
+    depends_on:
+      - api

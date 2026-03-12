@@ -3,10 +3,12 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"flag"
 	"fmt"
 	"log"
 	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	"github.com/google/uuid"
@@ -14,6 +16,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 
+	"jobqueue/internal/config"
 	"jobqueue/internal/jobs"
 	"jobqueue/internal/queue"
 	"jobqueue/proto/workerpb"
@@ -22,31 +25,24 @@ import (
 const maxAttempts = 3
 
 func main() {
-	// --port lets you run multiple workers locally without conflicts.
-	// e.g. go run ./cmd/worker/worker_main/main.go --port 9002
-	dispatchPort := flag.Int("port", 9001, "HTTP port this worker listens on for direct job dispatch")
-	flag.Parse()
+	cfg := config.Load()
 
 	workerID := uuid.NewString()
-	dispatchAddr := fmt.Sprintf("localhost:%d", *dispatchPort)
+	dispatchAddr := fmt.Sprintf("localhost:%s", cfg.WorkerDispatchPort)
 
 	// -------------------------------------------------------------------------
 	// Connect to RabbitMQ
 	// -------------------------------------------------------------------------
-	cfg := queue.Config{
-		URL:       "amqp://guest:guest@localhost:5672/",
-		QueueName: "jobs",
-	}
-
-	rmq, err := queue.NewRabbitMQ(&cfg)
+	rmq, err := queue.NewRabbitMQ(&queue.Config{
+		URL:       cfg.RabbitMQURL,
+		QueueName: cfg.RabbitMQQueue,
+	})
 	if err != nil {
 		log.Fatalf("failed to connect to RabbitMQ: %v", err)
 	}
-	defer rmq.Close()
 
 	// -------------------------------------------------------------------------
-	// Start HTTP dispatch server
-	// The API will POST jobs directly to /dispatch on this port.
+	// HTTP dispatch server
 	// -------------------------------------------------------------------------
 	mux := http.NewServeMux()
 	mux.HandleFunc("/dispatch", func(w http.ResponseWriter, r *http.Request) {
@@ -71,28 +67,31 @@ func main() {
 		w.WriteHeader(http.StatusOK)
 	})
 
+	httpServer := &http.Server{
+		Addr:    cfg.DispatchAddr(),
+		Handler: mux,
+	}
+
 	go func() {
-		log.Printf("HTTP dispatch server listening on :%d", *dispatchPort)
-		if err := http.ListenAndServe(fmt.Sprintf(":%d", *dispatchPort), mux); err != nil {
+		log.Printf("HTTP dispatch server listening on %s", cfg.DispatchAddr())
+		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("dispatch server error: %v", err)
 		}
 	}()
 
 	// -------------------------------------------------------------------------
-	// Connect to API gRPC server and register
+	// Connect to API gRPC and register
 	// -------------------------------------------------------------------------
 	conn, err := grpc.NewClient(
-		"localhost:50051",
+		cfg.APIGRPCAddr,
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 	)
 	if err != nil {
 		log.Fatalf("failed to connect to API gRPC: %v", err)
 	}
-	defer conn.Close()
 
 	apiClient := workerpb.NewWorkerServiceClient(conn)
 
-	// Register as "<uuid>@<dispatch-address>" so the API knows where to reach us
 	registrationID := fmt.Sprintf("%s@%s", workerID, dispatchAddr)
 	_, err = apiClient.Register(
 		context.Background(),
@@ -129,14 +128,14 @@ func main() {
 	}()
 
 	// -------------------------------------------------------------------------
-	// RabbitMQ consumer — handles queued (fallback) jobs
+	// RabbitMQ consumer
 	// -------------------------------------------------------------------------
 	if err := rmq.Channel().Qos(1, 0, false); err != nil {
 		log.Fatalf("failed to set QoS: %v", err)
 	}
 
 	msgs, err := rmq.Channel().Consume(
-		cfg.QueueName,
+		cfg.RabbitMQQueue,
 		"",
 		false,
 		false,
@@ -150,11 +149,31 @@ func main() {
 
 	log.Println("Worker ready — waiting for jobs")
 
-	for msg := range msgs {
-		currentLoad = 1
-		handleMessage(msg, rmq)
-		currentLoad = 0
-	}
+	// -------------------------------------------------------------------------
+	// Graceful shutdown
+	// -------------------------------------------------------------------------
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+
+	go func() {
+		for msg := range msgs {
+			currentLoad = 1
+			handleMessage(msg, rmq)
+			currentLoad = 0
+		}
+	}()
+
+	<-quit
+	log.Println("Shutting down worker...")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	httpServer.Shutdown(ctx)
+	rmq.Close()
+	conn.Close()
+
+	log.Println("Worker stopped cleanly")
 }
 
 func handleMessage(msg amqp.Delivery, rmq *queue.RabbitMQ) {

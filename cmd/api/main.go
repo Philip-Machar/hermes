@@ -1,12 +1,17 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"log"
 	"net"
 	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
+	"jobqueue/internal/config"
 	"jobqueue/internal/jobs"
 	"jobqueue/internal/queue"
 	"jobqueue/internal/worker"
@@ -17,20 +22,18 @@ import (
 )
 
 func main() {
+	cfg := config.Load()
 
 	// -------------------------------------------------------------------------
-	// RabbitMQ — fallback when no alive workers are available
+	// RabbitMQ
 	// -------------------------------------------------------------------------
-	cfg := queue.Config{
-		URL:       "amqp://guest:guest@localhost:5672/",
-		QueueName: "jobs",
-	}
-
-	rmq, err := queue.NewRabbitMQ(&cfg)
+	rmq, err := queue.NewRabbitMQ(&queue.Config{
+		URL:       cfg.RabbitMQURL,
+		QueueName: cfg.RabbitMQQueue,
+	})
 	if err != nil {
 		log.Fatal("RabbitMQ connect failed:", err)
 	}
-	defer rmq.Close()
 
 	// -------------------------------------------------------------------------
 	// Worker Registry
@@ -45,9 +48,9 @@ func main() {
 	}()
 
 	// -------------------------------------------------------------------------
-	// gRPC server — workers connect here to Register and Heartbeat
+	// gRPC server
 	// -------------------------------------------------------------------------
-	lis, err := net.Listen("tcp", ":50051")
+	lis, err := net.Listen("tcp", cfg.GRPCAddr())
 	if err != nil {
 		log.Fatal("gRPC listen failed:", err)
 	}
@@ -56,24 +59,54 @@ func main() {
 	workerpb.RegisterWorkerServiceServer(grpcServer, worker.NewGRPCServer(reg))
 
 	go func() {
-		log.Println("gRPC server listening on :50051...")
+		log.Printf("gRPC server listening on %s", cfg.GRPCAddr())
 		if err := grpcServer.Serve(lis); err != nil {
 			log.Fatal("gRPC server error:", err)
 		}
 	}()
 
 	// -------------------------------------------------------------------------
-	// HTTP routes
+	// HTTP server
 	// -------------------------------------------------------------------------
 	mux := http.NewServeMux()
 	mux.HandleFunc("/workers", handleGetWorkers(reg))
 	mux.HandleFunc("/jobs", handlePostJob(reg, rmq))
 
-	log.Println("API listening on :8081...")
-	log.Fatal(http.ListenAndServe(":8081", mux))
+	httpServer := &http.Server{
+		Addr:    cfg.HTTPAddr(),
+		Handler: mux,
+	}
+
+	go func() {
+		log.Printf("API listening on %s", cfg.HTTPAddr())
+		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatal("HTTP server error:", err)
+		}
+	}()
+
+	// -------------------------------------------------------------------------
+	// Graceful shutdown
+	// -------------------------------------------------------------------------
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+	<-quit
+
+	log.Println("Shutting down — draining in-flight requests...")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	if err := httpServer.Shutdown(ctx); err != nil {
+		log.Println("HTTP server forced to shut down:", err)
+	}
+
+	grpcServer.GracefulStop()
+	rmq.Close()
+
+	log.Println("API server stopped cleanly")
 }
 
-// GET /workers — returns all alive workers as JSON
+// GET /workers
 func handleGetWorkers(reg *worker.Registry) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
@@ -112,7 +145,7 @@ func handleGetWorkers(reg *worker.Registry) http.HandlerFunc {
 	}
 }
 
-// POST /jobs — dispatches directly to a worker over HTTP, falls back to RabbitMQ
+// POST /jobs
 func handlePostJob(reg *worker.Registry, rmq *queue.RabbitMQ) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
@@ -141,14 +174,12 @@ func handlePostJob(reg *worker.Registry, rmq *queue.RabbitMQ) http.HandlerFunc {
 
 		workerID := reg.PickWorker()
 
-		// No alive workers — fall back to RabbitMQ
 		if workerID == "" {
 			log.Printf("no alive workers — queuing job %s", job.ID)
 			enqueueToRabbitMQ(w, job, rmq, "no alive workers, job queued")
 			return
 		}
 
-		// Dispatch directly to the worker over HTTP
 		err := reg.DispatchJob(workerID, job.ID, job.Type, job.Payload)
 		if err != nil {
 			log.Printf("dispatch to worker %s failed: %v — queuing job %s", workerID, err, job.ID)

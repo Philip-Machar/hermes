@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"math"
 	"net/http"
 	"sync"
 	"time"
@@ -17,7 +18,7 @@ const workerTTL = time.Second * 15
 type workerInfo struct {
 	LastSeen time.Time
 	Load     int32
-	Address  string // HTTP dispatch address, e.g. "localhost:9001"
+	Address  string
 }
 
 type Registry struct {
@@ -31,7 +32,6 @@ func NewRegistry() *Registry {
 	}
 }
 
-// Register adds a worker with its dispatch address.
 func (r *Registry) Register(id, address string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -52,7 +52,6 @@ func (r *Registry) UpdateLoad(id string, load int32) {
 	}
 }
 
-// List returns a safe snapshot of all current workers.
 func (r *Registry) List() map[string]workerInfo {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -64,15 +63,24 @@ func (r *Registry) List() map[string]workerInfo {
 	return snapshot
 }
 
-// PickWorker returns the ID of the first alive worker, or "" if none.
+// PickWorker returns the ID of the worker with the lowest load.
+// If multiple workers share the lowest load, the first one found wins.
+// Returns "" if no workers are registered.
 func (r *Registry) PickWorker() string {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	for id := range r.workers {
-		return id
+	var bestID string
+	var bestLoad int32 = math.MaxInt32
+
+	for id, info := range r.workers {
+		if info.Load < bestLoad {
+			bestLoad = info.Load
+			bestID = id
+		}
 	}
-	return ""
+
+	return bestID
 }
 
 // DispatchJob sends a job directly to a worker over HTTP.
