@@ -179,7 +179,7 @@ func main() {
 	log.Println("Worker stopped cleanly")
 }
 
-func handleMessage(msg amqp.Delivery, rmq *queue.RabbitMQ) {
+func handleMessage(msg amqp.Delivery, rmq queue.Queue) {
 	var job jobs.Job
 
 	if err := json.Unmarshal(msg.Body, &job); err != nil {
