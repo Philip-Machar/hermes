@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"log"
 
+	"jobqueue/internal/config"
+
 	amqp "github.com/rabbitmq/amqp091-go"
 )
 
@@ -14,7 +16,9 @@ type DeadJob struct {
 }
 
 func main() {
-	conn, err := amqp.Dial("amqp://guest:guest@localhost:5672/")
+	cfg := config.Load()
+
+	conn, err := amqp.Dial(cfg.RabbitMQURL)
 	if err != nil {
 		log.Fatal("DLQ connect failed:", err)
 	}
@@ -27,7 +31,7 @@ func main() {
 	defer ch.Close()
 
 	msgs, err := ch.Consume(
-		"jobs.dlq",
+		cfg.RabbitMQDLQ,
 		"dlq-consumer",
 		false,
 		false,
@@ -39,7 +43,7 @@ func main() {
 		log.Fatal("DLQ consume failed:", err)
 	}
 
-	log.Println("DLQ consumer running")
+	log.Printf("DLQ consumer running — listening on %s", cfg.RabbitMQDLQ)
 
 	for msg := range msgs {
 		var job DeadJob
@@ -56,7 +60,6 @@ func main() {
 			job.Payload,
 		)
 
-		// Ack so it doesn't loop forever
 		msg.Ack(false)
 	}
 }

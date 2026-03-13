@@ -8,6 +8,7 @@ import (
 type Config struct {
 	RabbitMQURL        string
 	RabbitMQQueue      string
+	RabbitMQDLQ        string
 	APIHTTPPort        string
 	APIGRPCPort        string
 	APIGRPCAddr        string
@@ -15,11 +16,12 @@ type Config struct {
 }
 
 // Load reads config from environment variables with sensible defaults.
-// In development, values come from a .env file loaded by the shell or Docker.
+// In development, load a .env file before starting (or use docker-compose env).
 func Load() *Config {
 	return &Config{
 		RabbitMQURL:        getEnv("RABBITMQ_URL", "amqp://guest:guest@localhost:5672/"),
 		RabbitMQQueue:      getEnv("RABBITMQ_QUEUE", "jobs"),
+		RabbitMQDLQ:        getEnv("RABBITMQ_DLQ", "jobs.dlq"),
 		APIHTTPPort:        getEnv("API_HTTP_PORT", "8081"),
 		APIGRPCPort:        getEnv("API_GRPC_PORT", "50051"),
 		APIGRPCAddr:        getEnv("API_GRPC_ADDR", "localhost:50051"),

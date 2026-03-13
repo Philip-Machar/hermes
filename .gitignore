@@ -1,0 +1,28 @@
+# Environment variables — never commit real credentials
+.env
+
+# Go build outputs
+*.exe
+*.out
+/api
+/worker
+
+# Go test cache
+*.test
+*.prof
+
+# Dependency directories
+vendor/
+
+# IDE and editor files
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+
+# Docker volumes and temp data
+data/
+
+# Log files
+*.log
