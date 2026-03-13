@@ -1,6 +1,9 @@
 package queue
 
 import (
+	"log"
+	"time"
+
 	amqp "github.com/rabbitmq/amqp091-go"
 )
 
@@ -10,9 +13,21 @@ type RabbitMQ struct {
 	queue string
 }
 
-// RabbitMQ constructor
+// NewRabbitMQ connects to RabbitMQ, retrying up to 20 times with a 5 second
+// delay between attempts. RabbitMQ can take 45-60s to fully start inside
+// Docker, so 20 × 5s = 100s gives it plenty of headroom.
 func NewRabbitMQ(cfg *Config) (*RabbitMQ, error) {
-	conn, err := amqp.Dial(cfg.URL)
+	var conn *amqp.Connection
+	var err error
+
+	for i := 1; i <= 20; i++ {
+		conn, err = amqp.Dial(cfg.URL)
+		if err == nil {
+			break
+		}
+		log.Printf("RabbitMQ not ready (attempt %d/20): %v — retrying in 5s...", i, err)
+		time.Sleep(5 * time.Second)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -69,7 +84,7 @@ func NewRabbitMQ(cfg *Config) (*RabbitMQ, error) {
 	}
 
 	_, err = ch.QueueDeclare(
-		cfg.QueueName, // "jobs"
+		cfg.QueueName,
 		true,
 		false,
 		false,

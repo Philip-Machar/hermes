@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -28,7 +27,10 @@ func main() {
 	cfg := config.Load()
 
 	workerID := uuid.NewString()
-	dispatchAddr := fmt.Sprintf("localhost:%s", cfg.WorkerDispatchPort)
+	// Use cfg.WorkerDispatchAddress() so WORKER_HOST is respected in Docker
+	// (resolves to "worker:<port>") while still defaulting to "localhost:<port>"
+	// when running locally.
+	dispatchAddr := cfg.WorkerDispatchAddress()
 
 	// -------------------------------------------------------------------------
 	// Connect to RabbitMQ
@@ -92,7 +94,8 @@ func main() {
 
 	apiClient := workerpb.NewWorkerServiceClient(conn)
 
-	registrationID := fmt.Sprintf("%s@%s", workerID, dispatchAddr)
+	// Register with format "uuid@host:port" so the API can store the dispatch address.
+	registrationID := workerID + "@" + dispatchAddr
 	_, err = apiClient.Register(
 		context.Background(),
 		&workerpb.RegisterRequest{WorkerId: registrationID},
@@ -181,15 +184,26 @@ func handleMessage(msg amqp.Delivery, rmq *queue.RabbitMQ) {
 
 	if err := json.Unmarshal(msg.Body, &job); err != nil {
 		log.Println("invalid job payload, discarded:", err)
+		// Malformed message — Nack without requeue so it routes to DLQ via DLX.
 		_ = msg.Nack(false, false)
 		return
 	}
 
 	log.Printf("[queue] job received: id=%s type=%s attempt=%d", job.ID, job.Type, job.Attempts)
 
-	if job.Attempts < maxAttempts-1 {
-		job.Attempts++
-		log.Printf("[queue] job %s retrying (%d/%d)", job.ID, job.Attempts, maxAttempts)
+	// Simulate job processing — replace this with real handler logic.
+	jobSucceeded := true // TODO: run the actual job here
+
+	if jobSucceeded {
+		log.Printf("[queue] job %s succeeded on attempt %d", job.ID, job.Attempts)
+		_ = msg.Ack(false)
+		return
+	}
+
+	// Job failed — decide whether to retry or send to DLQ.
+	job.Attempts++
+	if job.Attempts < maxAttempts {
+		log.Printf("[queue] job %s failed, retrying (%d/%d)", job.ID, job.Attempts, maxAttempts)
 
 		data, err := json.Marshal(job)
 		if err != nil {
@@ -198,14 +212,16 @@ func handleMessage(msg amqp.Delivery, rmq *queue.RabbitMQ) {
 			return
 		}
 
-		_ = msg.Nack(false, false)
-
+		// Ack the original message and re-publish with the incremented attempt
+		// counter so retries are tracked correctly.
+		_ = msg.Ack(false)
 		if err := rmq.Publish(data); err != nil {
-			log.Println("failed to re-publish job:", err)
+			log.Printf("failed to re-publish job %s: %v", job.ID, err)
 		}
 		return
 	}
 
-	log.Printf("[queue] job %s succeeded", job.ID)
-	_ = msg.Ack(false)
+	// Exhausted all attempts — Nack without requeue so the DLX routes it to DLQ.
+	log.Printf("[queue] job %s exhausted all %d attempts — sending to DLQ", job.ID, maxAttempts)
+	_ = msg.Nack(false, false)
 }
