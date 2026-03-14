@@ -1,6 +1,8 @@
 package main
 
 import (
+	"embed"
+	"io/fs"
 	"log"
 	"net"
 	"net/http"
@@ -17,12 +19,12 @@ import (
 	"jobqueue/proto/workerpb"
 )
 
+//go:embed static
+var staticFiles embed.FS
+
 func main() {
 	cfg := config.Load()
 
-	// -------------------------------------------------------------------------
-	// Connect to RabbitMQ
-	// -------------------------------------------------------------------------
 	rmq, err := queue.NewRabbitMQ(&queue.Config{
 		URL:       cfg.RabbitMQURL,
 		QueueName: cfg.RabbitMQQueue,
@@ -32,9 +34,6 @@ func main() {
 	}
 	defer rmq.Close()
 
-	// -------------------------------------------------------------------------
-	// Worker registry + cleanup ticker
-	// -------------------------------------------------------------------------
 	registry := worker.NewRegistry()
 
 	go func() {
@@ -45,9 +44,6 @@ func main() {
 		}
 	}()
 
-	// -------------------------------------------------------------------------
-	// gRPC server — workers Register and Heartbeat here
-	// -------------------------------------------------------------------------
 	grpcServer := grpc.NewServer()
 	workerpb.RegisterWorkerServiceServer(grpcServer, worker.NewGRPCServer(registry))
 
@@ -63,12 +59,16 @@ func main() {
 		}
 	}()
 
-	// -------------------------------------------------------------------------
-	// HTTP API server
-	// -------------------------------------------------------------------------
 	mux := http.NewServeMux()
 	mux.HandleFunc("/jobs", jobsHandler(registry, rmq))
 	mux.HandleFunc("/workers", workersHandler(registry))
+
+	// Serve the dashboard at GET /
+	staticFS, err := fs.Sub(staticFiles, "static")
+	if err != nil {
+		log.Fatalf("failed to create static sub-filesystem: %v", err)
+	}
+	mux.Handle("/", http.FileServer(http.FS(staticFS)))
 
 	httpServer := &http.Server{
 		Addr:    cfg.HTTPAddr(),
@@ -82,9 +82,6 @@ func main() {
 		}
 	}()
 
-	// -------------------------------------------------------------------------
-	// Graceful shutdown
-	// -------------------------------------------------------------------------
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	<-quit
