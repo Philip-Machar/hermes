@@ -433,17 +433,6 @@
     }
     .footer-txt { font-size: 0.58rem; color: var(--text-dim); letter-spacing: 0.12em; }
 
-    /* ── Refresh bar ── */
-    #refreshBar {
-      position: fixed;
-      top: 0; left: 0;
-      height: 1px;
-      background: var(--amber);
-      width: 0%;
-      z-index: 999;
-      transition: width 0.08s linear;
-    }
-
     /* ── Toast ── */
     .toast {
       position: fixed;
@@ -466,8 +455,6 @@
   </style>
 </head>
 <body>
-
-<div id="refreshBar"></div>
 
 <div class="shell">
   <header>
@@ -572,15 +559,6 @@
   tickClock();
   setInterval(tickClock, 1000);
 
-  // ── Refresh bar ────────────────────────────────────────────────────────────
-  function animateBar(ts) {
-    if (!barStart) barStart = ts;
-    const pct = Math.min(((ts - barStart) / POLL_MS) * 100, 100);
-    document.getElementById('refreshBar').style.width = pct + '%';
-    if (pct < 100) requestAnimationFrame(animateBar);
-    else document.getElementById('refreshBar').style.width = '0%';
-  }
-
   // ── Poll /workers ──────────────────────────────────────────────────────────
   async function pollWorkers() {
     try {
@@ -684,8 +662,6 @@
 
   // ── Combined poll ──────────────────────────────────────────────────────────
   async function poll() {
-    barStart = null;
-    requestAnimationFrame(animateBar);
     await Promise.all([pollWorkers(), pollEvents()]);
   }
 
