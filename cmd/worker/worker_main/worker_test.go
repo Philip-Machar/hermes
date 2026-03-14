@@ -84,22 +84,56 @@ func TestHandleMessage_InvalidJSON_NackedAndDiscarded(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Valid job — current stub behaviour: jobSucceeded=true → Ack
-// Update when real job processing replaces the stub.
+// Known job type (email) — succeeds → Acked, nothing re-published
 // ---------------------------------------------------------------------------
 
 func TestHandleMessage_ValidJob_Acked(t *testing.T) {
 	q := &stubQueue{}
-	job := jobs.Job{ID: "j1", Type: "email", Attempts: 0}
+	job := jobs.Job{
+		ID:       "j1",
+		Type:     "email",
+		Payload:  map[string]interface{}{"to": "user@example.com", "subject": "Hello"},
+		Attempts: 0,
+	}
 	d, acker := jobDelivery(t, job)
 
 	handleMessage(d, q)
 
 	if !acker.acked {
-		t.Error("expected Ack for successful job (jobSucceeded=true)")
+		t.Error("expected Ack for successful email job")
 	}
 	if len(q.published) != 0 {
 		t.Errorf("expected 0 re-published messages, got %d", len(q.published))
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Unknown job type — Nacked without requeue on first attempt (no retry)
+// ---------------------------------------------------------------------------
+
+func TestHandleMessage_UnknownJobType_NackedWithoutRetry(t *testing.T) {
+	q := &stubQueue{}
+	job := jobs.Job{ID: "j2", Type: "unknown-type", Attempts: 0}
+	d, acker := jobDelivery(t, job)
+
+	handleMessage(d, q)
+
+	// First failure → attempts becomes 1, which is < maxAttempts(3), so it
+	// should be Acked and re-published with incremented attempt counter.
+	if !acker.acked {
+		t.Error("expected Ack before re-publish on first failure")
+	}
+	if len(q.published) != 1 {
+		t.Errorf("expected 1 re-published message for retry, got %d", len(q.published))
+	}
+
+	// Verify the re-published message has attempts incremented to 1.
+	var retried jobs.Job
+	if err := json.Unmarshal(q.published[0], &retried); err != nil {
+		t.Fatalf("could not unmarshal re-published job: %v", err)
+	}
+	if retried.Attempts != 1 {
+		t.Errorf("expected attempts=1 in re-published job, got %d", retried.Attempts)
 	}
 }
 
@@ -108,7 +142,7 @@ func TestHandleMessage_ValidJob_Acked(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestHandleMessage_AttemptsPreservedInPayload(t *testing.T) {
-	job := jobs.Job{ID: "j1", Type: "resize", Attempts: 1}
+	job := jobs.Job{ID: "j1", Type: "resize-image", Attempts: 1}
 	body, _ := json.Marshal(job)
 
 	var roundTripped jobs.Job
@@ -125,9 +159,23 @@ func TestHandleMessage_AttemptsPreservedInPayload(t *testing.T) {
 
 // ---------------------------------------------------------------------------
 // DLQ path — Nack without requeue when attempts == maxAttempts
-// Skipped until real job processing is wired into handleMessage.
 // ---------------------------------------------------------------------------
 
 func TestHandleMessage_ExhaustedAttempts_NackedToDLQ(t *testing.T) {
-	t.Skip("DLQ path requires jobSucceeded=false; wire real job processing first")
+	q := &stubQueue{}
+	// attempts=2, maxAttempts=3: after increment → 3, which is not < 3, so DLQ.
+	job := jobs.Job{ID: "j3", Type: "unknown-type", Attempts: 2}
+	d, acker := jobDelivery(t, job)
+
+	handleMessage(d, q)
+
+	if !acker.nacked {
+		t.Error("expected Nack when attempts exhausted")
+	}
+	if acker.nackRequeue {
+		t.Error("expected Nack without requeue (to DLQ)")
+	}
+	if len(q.published) != 0 {
+		t.Errorf("expected nothing re-published after DLQ, got %d", len(q.published))
+	}
 }

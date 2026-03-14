@@ -17,11 +17,22 @@ import (
 
 	"jobqueue/internal/config"
 	"jobqueue/internal/jobs"
+	"jobqueue/internal/jobs/handlers"
 	"jobqueue/internal/queue"
 	"jobqueue/proto/workerpb"
 )
 
 const maxAttempts = 3
+
+// handlerRegistry is the process-wide job handler registry.
+// Handlers are registered once at startup and are safe for concurrent use.
+var handlerRegistry *jobs.HandlerRegistry
+
+func init() {
+	handlerRegistry = jobs.NewHandlerRegistry()
+	handlerRegistry.Register("email", &handlers.EmailHandler{})
+	handlerRegistry.Register("resize-image", &handlers.ResizeImageHandler{})
+}
 
 func main() {
 	cfg := config.Load()
@@ -63,9 +74,21 @@ func main() {
 			return
 		}
 
-		log.Printf("[direct] job received: id=%s type=%s", req.JobID, req.JobType)
-		log.Printf("[direct] job %s completed", req.JobID)
+		job := jobs.Job{
+			ID:      req.JobID,
+			Type:    req.JobType,
+			Payload: req.Payload,
+		}
 
+		log.Printf("[direct] job received: id=%s type=%s", job.ID, job.Type)
+
+		if err := handlerRegistry.Dispatch(r.Context(), job); err != nil {
+			log.Printf("[direct] job %s failed: %v", job.ID, err)
+			http.Error(w, "job processing failed", http.StatusInternalServerError)
+			return
+		}
+
+		log.Printf("[direct] job %s completed", job.ID)
 		w.WriteHeader(http.StatusOK)
 	})
 
@@ -191,19 +214,23 @@ func handleMessage(msg amqp.Delivery, rmq queue.Queue) {
 
 	log.Printf("[queue] job received: id=%s type=%s attempt=%d", job.ID, job.Type, job.Attempts)
 
-	// Simulate job processing — replace this with real handler logic.
-	jobSucceeded := true // TODO: run the actual job here
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
 
-	if jobSucceeded {
+	err := handlerRegistry.Dispatch(ctx, job)
+
+	if err == nil {
 		log.Printf("[queue] job %s succeeded on attempt %d", job.ID, job.Attempts)
 		_ = msg.Ack(false)
 		return
 	}
 
 	// Job failed — decide whether to retry or send to DLQ.
+	log.Printf("[queue] job %s failed on attempt %d: %v", job.ID, job.Attempts, err)
 	job.Attempts++
+
 	if job.Attempts < maxAttempts {
-		log.Printf("[queue] job %s failed, retrying (%d/%d)", job.ID, job.Attempts, maxAttempts)
+		log.Printf("[queue] retrying job %s (%d/%d)", job.ID, job.Attempts, maxAttempts)
 
 		data, err := json.Marshal(job)
 		if err != nil {
@@ -212,8 +239,7 @@ func handleMessage(msg amqp.Delivery, rmq queue.Queue) {
 			return
 		}
 
-		// Ack the original message and re-publish with the incremented attempt
-		// counter so retries are tracked correctly.
+		// Ack the original and re-publish with the incremented attempt counter.
 		_ = msg.Ack(false)
 		if err := rmq.Publish(data); err != nil {
 			log.Printf("failed to re-publish job %s: %v", job.ID, err)
@@ -221,7 +247,7 @@ func handleMessage(msg amqp.Delivery, rmq queue.Queue) {
 		return
 	}
 
-	// Exhausted all attempts — Nack without requeue so the DLX routes it to DLQ.
+	// Exhausted all attempts — Nack without requeue so DLX routes it to DLQ.
 	log.Printf("[queue] job %s exhausted all %d attempts — sending to DLQ", job.ID, maxAttempts)
 	_ = msg.Nack(false, false)
 }
