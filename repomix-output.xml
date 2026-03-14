@@ -42,12 +42,15 @@ The content is organized as follows:
 <directory_structure>
 cmd/
   api/
+    handlers_test.go
+    handlers.go
     main.go
   worker/
     dlq_consumer/
       main.go
     worker_main/
       main.go
+      worker_test.go
 docker/
   Dockerfile.api
   Dockerfile.worker
@@ -61,7 +64,9 @@ internal/
     queue.go
     rabbitmq.go
   worker/
+    grpc_server_test.go
     grpc_server.go
+    registry_test.go
     registry.go
 proto/
   workerpb/
@@ -77,6 +82,541 @@ README.md
 
 <files>
 This section contains the contents of the repository's files.
+
+<file path="cmd/api/handlers_test.go">
+package main
+
+import (
+	"encoding/json"
+	"errors"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+
+	"jobqueue/internal/worker"
+)
+
+// ---------------------------------------------------------------------------
+// Stub queue — satisfies queue.Queue without RabbitMQ
+// ---------------------------------------------------------------------------
+
+type stubQueue struct {
+	published [][]byte
+	failNext  bool
+}
+
+func (s *stubQueue) Publish(body []byte) error {
+	if s.failNext {
+		s.failNext = false
+		return errors.New("publish failed")
+	}
+	s.published = append(s.published, body)
+	return nil
+}
+
+func (s *stubQueue) Close() error { return nil }
+
+// ---------------------------------------------------------------------------
+// POST /jobs — wrong method
+// ---------------------------------------------------------------------------
+
+func TestJobsHandler_WrongMethod(t *testing.T) {
+	reg := worker.NewRegistry()
+	q := &stubQueue{}
+
+	req := httptest.NewRequest(http.MethodGet, "/jobs", nil)
+	rr := httptest.NewRecorder()
+	jobsHandler(reg, q)(rr, req)
+
+	if rr.Code != http.StatusMethodNotAllowed {
+		t.Errorf("expected 405, got %d", rr.Code)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// POST /jobs — bad JSON body
+// ---------------------------------------------------------------------------
+
+func TestJobsHandler_InvalidBody(t *testing.T) {
+	reg := worker.NewRegistry()
+	q := &stubQueue{}
+
+	req := httptest.NewRequest(http.MethodPost, "/jobs", strings.NewReader("{bad json}"))
+	req.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+	jobsHandler(reg, q)(rr, req)
+
+	if rr.Code != http.StatusBadRequest {
+		t.Errorf("expected 400, got %d", rr.Code)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// POST /jobs — no workers → routed to queue
+// ---------------------------------------------------------------------------
+
+func TestJobsHandler_NoWorkers_RoutedToQueue(t *testing.T) {
+	reg := worker.NewRegistry() // empty registry
+	q := &stubQueue{}
+
+	body := `{"type":"email","payload":{"to":"a@b.com"}}`
+	req := httptest.NewRequest(http.MethodPost, "/jobs", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+	jobsHandler(reg, q)(rr, req)
+
+	if rr.Code != http.StatusAccepted {
+		t.Errorf("expected 202, got %d", rr.Code)
+	}
+
+	var resp map[string]interface{}
+	if err := json.NewDecoder(rr.Body).Decode(&resp); err != nil {
+		t.Fatalf("could not decode response: %v", err)
+	}
+	if resp["routed"] != "queue" {
+		t.Errorf("expected routed=queue, got %v", resp["routed"])
+	}
+	if len(q.published) != 1 {
+		t.Errorf("expected 1 published message, got %d", len(q.published))
+	}
+}
+
+// ---------------------------------------------------------------------------
+// POST /jobs — worker alive → routed direct
+// ---------------------------------------------------------------------------
+
+func TestJobsHandler_WithWorker_RoutedDirect(t *testing.T) {
+	// Spin up a fake worker dispatch server.
+	workerServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer workerServer.Close()
+
+	reg := worker.NewRegistry()
+	// Strip scheme — registry prepends "http://" internally.
+	reg.Register("w1", workerServer.Listener.Addr().String())
+
+	q := &stubQueue{}
+
+	body := `{"type":"email","payload":{"to":"a@b.com"}}`
+	req := httptest.NewRequest(http.MethodPost, "/jobs", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+	jobsHandler(reg, q)(rr, req)
+
+	if rr.Code != http.StatusAccepted {
+		t.Errorf("expected 202, got %d", rr.Code)
+	}
+
+	var resp map[string]interface{}
+	if err := json.NewDecoder(rr.Body).Decode(&resp); err != nil {
+		t.Fatalf("could not decode response: %v", err)
+	}
+	if resp["routed"] != "direct" {
+		t.Errorf("expected routed=direct, got %v", resp["routed"])
+	}
+	if resp["worker_id"] != "w1" {
+		t.Errorf("expected worker_id=w1, got %v", resp["worker_id"])
+	}
+	// Nothing should have been queued.
+	if len(q.published) != 0 {
+		t.Errorf("expected 0 published messages, got %d", len(q.published))
+	}
+}
+
+// ---------------------------------------------------------------------------
+// POST /jobs — worker dispatch fails → falls back to queue
+// ---------------------------------------------------------------------------
+
+func TestJobsHandler_WorkerDispatchFails_FallsBackToQueue(t *testing.T) {
+	// Fake worker that always returns 500.
+	workerServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer workerServer.Close()
+
+	reg := worker.NewRegistry()
+	reg.Register("w1", workerServer.Listener.Addr().String())
+
+	q := &stubQueue{}
+
+	body := `{"type":"email","payload":{}}`
+	req := httptest.NewRequest(http.MethodPost, "/jobs", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+	jobsHandler(reg, q)(rr, req)
+
+	if rr.Code != http.StatusAccepted {
+		t.Errorf("expected 202, got %d", rr.Code)
+	}
+
+	var resp map[string]interface{}
+	if err := json.NewDecoder(rr.Body).Decode(&resp); err != nil {
+		t.Fatalf("could not decode response: %v", err)
+	}
+	if resp["routed"] != "queue" {
+		t.Errorf("expected routed=queue after dispatch failure, got %v", resp["routed"])
+	}
+	if len(q.published) != 1 {
+		t.Errorf("expected 1 published message after fallback, got %d", len(q.published))
+	}
+}
+
+// ---------------------------------------------------------------------------
+// POST /jobs — response contains expected job fields
+// ---------------------------------------------------------------------------
+
+func TestJobsHandler_ResponseContainsJobFields(t *testing.T) {
+	reg := worker.NewRegistry()
+	q := &stubQueue{}
+
+	body := `{"type":"resize-image","payload":{"url":"https://example.com/img.png"}}`
+	req := httptest.NewRequest(http.MethodPost, "/jobs", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+	jobsHandler(reg, q)(rr, req)
+
+	var resp map[string]interface{}
+	json.NewDecoder(rr.Body).Decode(&resp)
+
+	jobField, ok := resp["job"].(map[string]interface{})
+	if !ok {
+		t.Fatal("expected job field in response")
+	}
+	if jobField["type"] != "resize-image" {
+		t.Errorf("expected type resize-image, got %v", jobField["type"])
+	}
+	if jobField["id"] == "" || jobField["id"] == nil {
+		t.Error("expected non-empty job id")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// GET /workers — wrong method
+// ---------------------------------------------------------------------------
+
+func TestWorkersHandler_WrongMethod(t *testing.T) {
+	reg := worker.NewRegistry()
+
+	req := httptest.NewRequest(http.MethodPost, "/workers", nil)
+	rr := httptest.NewRecorder()
+	workersHandler(reg)(rr, req)
+
+	if rr.Code != http.StatusMethodNotAllowed {
+		t.Errorf("expected 405, got %d", rr.Code)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// GET /workers — empty registry
+// ---------------------------------------------------------------------------
+
+func TestWorkersHandler_EmptyRegistry(t *testing.T) {
+	reg := worker.NewRegistry()
+
+	req := httptest.NewRequest(http.MethodGet, "/workers", nil)
+	rr := httptest.NewRecorder()
+	workersHandler(reg)(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Errorf("expected 200, got %d", rr.Code)
+	}
+
+	var resp map[string]interface{}
+	json.NewDecoder(rr.Body).Decode(&resp)
+
+	if resp["count"].(float64) != 0 {
+		t.Errorf("expected count 0, got %v", resp["count"])
+	}
+}
+
+// ---------------------------------------------------------------------------
+// GET /workers — returns correct count and status
+// ---------------------------------------------------------------------------
+
+func TestWorkersHandler_ReturnsWorkersWithStatus(t *testing.T) {
+	reg := worker.NewRegistry()
+	reg.Register("w1", "localhost:9001")
+	reg.Register("w2", "localhost:9002")
+	reg.UpdateLoad("w2", 1) // mark w2 as busy
+
+	req := httptest.NewRequest(http.MethodGet, "/workers", nil)
+	rr := httptest.NewRecorder()
+	workersHandler(reg)(rr, req)
+
+	var resp map[string]interface{}
+	json.NewDecoder(rr.Body).Decode(&resp)
+
+	if resp["count"].(float64) != 2 {
+		t.Errorf("expected count 2, got %v", resp["count"])
+	}
+
+	workers := resp["workers"].([]interface{})
+	statusByID := make(map[string]string)
+	for _, w := range workers {
+		wm := w.(map[string]interface{})
+		statusByID[wm["worker_id"].(string)] = wm["status"].(string)
+	}
+
+	if statusByID["w1"] != "idle" {
+		t.Errorf("expected w1 idle, got %s", statusByID["w1"])
+	}
+	if statusByID["w2"] != "busy" {
+		t.Errorf("expected w2 busy, got %s", statusByID["w2"])
+	}
+}
+</file>
+
+<file path="cmd/api/handlers.go">
+package main
+
+import (
+	"encoding/json"
+	"log"
+	"net/http"
+
+	"github.com/google/uuid"
+
+	"jobqueue/internal/jobs"
+	"jobqueue/internal/queue"
+	"jobqueue/internal/worker"
+)
+
+// jobsHandler handles POST /jobs.
+func jobsHandler(registry *worker.Registry, rmq queue.Queue) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		var body struct {
+			Type    string      `json:"type"`
+			Payload interface{} `json:"payload"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			http.Error(w, "invalid request: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+
+		job := jobs.Job{
+			ID:       uuid.NewString(),
+			Type:     body.Type,
+			Payload:  body.Payload,
+			Attempts: 0,
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusAccepted)
+
+		workerID := registry.PickWorker()
+		if workerID != "" {
+			if err := registry.DispatchJob(workerID, job.ID, job.Type, job.Payload); err == nil {
+				log.Printf("job %s dispatched directly to worker %s", job.ID, workerID)
+				json.NewEncoder(w).Encode(map[string]interface{}{
+					"job":       job,
+					"routed":    "direct",
+					"worker_id": workerID,
+				})
+				return
+			}
+			log.Printf("direct dispatch to worker %s failed, falling back to queue", workerID)
+		}
+
+		data, err := json.Marshal(job)
+		if err != nil {
+			http.Error(w, "failed to encode job", http.StatusInternalServerError)
+			return
+		}
+		if err := rmq.Publish(data); err != nil {
+			http.Error(w, "failed to queue job", http.StatusInternalServerError)
+			return
+		}
+		log.Printf("job %s queued (no alive workers)", job.ID)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"job":    job,
+			"routed": "queue",
+			"note":   "no alive workers, job queued",
+		})
+	}
+}
+
+// workersHandler handles GET /workers.
+func workersHandler(registry *worker.Registry) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		snapshot := registry.List()
+
+		type workerView struct {
+			WorkerID     string `json:"worker_id"`
+			LastSeenUnix int64  `json:"last_seen_unix"`
+			Load         int32  `json:"load"`
+			Status       string `json:"status"`
+		}
+
+		workers := make([]workerView, 0, len(snapshot))
+		for id, info := range snapshot {
+			status := "idle"
+			if info.Load > 0 {
+				status = "busy"
+			}
+			workers = append(workers, workerView{
+				WorkerID:     id,
+				LastSeenUnix: info.LastSeen.Unix(),
+				Load:         info.Load,
+				Status:       status,
+			})
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"count":   len(workers),
+			"workers": workers,
+		})
+	}
+}
+</file>
+
+<file path="cmd/worker/worker_main/worker_test.go">
+package main
+
+import (
+	"encoding/json"
+	"testing"
+
+	amqp "github.com/rabbitmq/amqp091-go"
+
+	"jobqueue/internal/jobs"
+)
+
+// ---------------------------------------------------------------------------
+// Stub queue.Queue
+// ---------------------------------------------------------------------------
+
+type stubQueue struct {
+	published [][]byte
+}
+
+func (s *stubQueue) Publish(body []byte) error {
+	s.published = append(s.published, body)
+	return nil
+}
+
+func (s *stubQueue) Close() error { return nil }
+
+// ---------------------------------------------------------------------------
+// deliveryAcker records which acknowledgement method was called.
+// ---------------------------------------------------------------------------
+
+type deliveryAcker struct {
+	acked       bool
+	nacked      bool
+	nackRequeue bool
+}
+
+func (a *deliveryAcker) Ack(_ uint64, _ bool) error {
+	a.acked = true
+	return nil
+}
+
+func (a *deliveryAcker) Nack(_ uint64, _ bool, requeue bool) error {
+	a.nacked = true
+	a.nackRequeue = requeue
+	return nil
+}
+
+func (a *deliveryAcker) Reject(_ uint64, _ bool) error { return nil }
+
+// ---------------------------------------------------------------------------
+// Helper — build an amqp.Delivery from a Job
+// ---------------------------------------------------------------------------
+
+func jobDelivery(t *testing.T, job jobs.Job) (amqp.Delivery, *deliveryAcker) {
+	t.Helper()
+	body, err := json.Marshal(job)
+	if err != nil {
+		t.Fatalf("marshal failed: %v", err)
+	}
+	acker := &deliveryAcker{}
+	return amqp.Delivery{Body: body, Acknowledger: acker}, acker
+}
+
+// ---------------------------------------------------------------------------
+// Invalid JSON — Nacked without requeue, nothing published
+// ---------------------------------------------------------------------------
+
+func TestHandleMessage_InvalidJSON_NackedAndDiscarded(t *testing.T) {
+	q := &stubQueue{}
+	acker := &deliveryAcker{}
+	d := amqp.Delivery{Body: []byte("{bad json}"), Acknowledger: acker}
+
+	handleMessage(d, q)
+
+	if !acker.nacked {
+		t.Error("expected Nack for invalid JSON")
+	}
+	if acker.nackRequeue {
+		t.Error("expected Nack without requeue")
+	}
+	if len(q.published) != 0 {
+		t.Errorf("expected nothing published, got %d", len(q.published))
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Valid job — current stub behaviour: jobSucceeded=true → Ack
+// Update when real job processing replaces the stub.
+// ---------------------------------------------------------------------------
+
+func TestHandleMessage_ValidJob_Acked(t *testing.T) {
+	q := &stubQueue{}
+	job := jobs.Job{ID: "j1", Type: "email", Attempts: 0}
+	d, acker := jobDelivery(t, job)
+
+	handleMessage(d, q)
+
+	if !acker.acked {
+		t.Error("expected Ack for successful job (jobSucceeded=true)")
+	}
+	if len(q.published) != 0 {
+		t.Errorf("expected 0 re-published messages, got %d", len(q.published))
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Attempts counter is preserved through JSON round-trip
+// ---------------------------------------------------------------------------
+
+func TestHandleMessage_AttemptsPreservedInPayload(t *testing.T) {
+	job := jobs.Job{ID: "j1", Type: "resize", Attempts: 1}
+	body, _ := json.Marshal(job)
+
+	var roundTripped jobs.Job
+	if err := json.Unmarshal(body, &roundTripped); err != nil {
+		t.Fatalf("unmarshal failed: %v", err)
+	}
+	if roundTripped.Attempts != 1 {
+		t.Errorf("expected attempts 1, got %d", roundTripped.Attempts)
+	}
+	if roundTripped.ID != "j1" {
+		t.Errorf("expected ID j1, got %s", roundTripped.ID)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// DLQ path — Nack without requeue when attempts == maxAttempts
+// Skipped until real job processing is wired into handleMessage.
+// ---------------------------------------------------------------------------
+
+func TestHandleMessage_ExhaustedAttempts_NackedToDLQ(t *testing.T) {
+	t.Skip("DLQ path requires jobSucceeded=false; wire real job processing first")
+}
+</file>
 
 <file path="docker/Dockerfile.api">
 FROM golang:1.24-alpine AS builder
@@ -123,6 +663,444 @@ package queue
 type Queue interface {
 	Publish(body []byte) error
 	Close() error
+}
+</file>
+
+<file path="internal/worker/grpc_server_test.go">
+package worker
+
+import (
+	"context"
+	"testing"
+
+	"jobqueue/proto/workerpb"
+)
+
+// ---------------------------------------------------------------------------
+// splitWorkerID
+// ---------------------------------------------------------------------------
+
+func TestSplitWorkerID_WithAt(t *testing.T) {
+	id, addr := splitWorkerID("abc-123@localhost:9001")
+	if id != "abc-123" {
+		t.Errorf("expected id abc-123, got %q", id)
+	}
+	if addr != "localhost:9001" {
+		t.Errorf("expected addr localhost:9001, got %q", addr)
+	}
+}
+
+func TestSplitWorkerID_WithoutAt(t *testing.T) {
+	id, addr := splitWorkerID("abc-123")
+	if id != "abc-123" {
+		t.Errorf("expected id abc-123, got %q", id)
+	}
+	if addr != "" {
+		t.Errorf("expected empty addr, got %q", addr)
+	}
+}
+
+func TestSplitWorkerID_MultipleAtSigns(t *testing.T) {
+	// Only the first @ is the separator; the address itself may contain @.
+	id, addr := splitWorkerID("abc@host@9001")
+	if id != "abc" {
+		t.Errorf("expected id abc, got %q", id)
+	}
+	if addr != "host@9001" {
+		t.Errorf("expected addr host@9001, got %q", addr)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// GRPCServer.Register
+// ---------------------------------------------------------------------------
+
+func TestGRPCServer_Register_StoresWorker(t *testing.T) {
+	reg := NewRegistry()
+	srv := NewGRPCServer(reg)
+
+	resp, err := srv.Register(context.Background(), &workerpb.RegisterRequest{
+		WorkerId: "worker-1@localhost:9001",
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if resp.Status != "ok" {
+		t.Errorf("expected status ok, got %q", resp.Status)
+	}
+
+	snapshot := reg.List()
+	info, ok := snapshot["worker-1"]
+	if !ok {
+		t.Fatal("expected worker-1 in registry after Register")
+	}
+	if info.Address != "localhost:9001" {
+		t.Errorf("expected address localhost:9001, got %q", info.Address)
+	}
+}
+
+func TestGRPCServer_Register_WithoutAddress(t *testing.T) {
+	reg := NewRegistry()
+	srv := NewGRPCServer(reg)
+
+	resp, err := srv.Register(context.Background(), &workerpb.RegisterRequest{
+		WorkerId: "worker-1", // no @ separator
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if resp.Status != "ok" {
+		t.Errorf("expected status ok, got %q", resp.Status)
+	}
+
+	snapshot := reg.List()
+	info, ok := snapshot["worker-1"]
+	if !ok {
+		t.Fatal("expected worker-1 in registry")
+	}
+	if info.Address != "" {
+		t.Errorf("expected empty address, got %q", info.Address)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// GRPCServer.Heartbeat
+// ---------------------------------------------------------------------------
+
+func TestGRPCServer_Heartbeat_UpdatesLoad(t *testing.T) {
+	reg := NewRegistry()
+	srv := NewGRPCServer(reg)
+
+	// Register first so there is a worker to heartbeat.
+	reg.Register("worker-1", "localhost:9001")
+
+	resp, err := srv.Heartbeat(context.Background(), &workerpb.HeartbeatRequest{
+		WorkerId: "worker-1",
+		Load:     7,
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if resp.Status != "alive" {
+		t.Errorf("expected status alive, got %q", resp.Status)
+	}
+
+	snapshot := reg.List()
+	if snapshot["worker-1"].Load != 7 {
+		t.Errorf("expected load 7, got %d", snapshot["worker-1"].Load)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// GRPCServer.ListWorkers
+// ---------------------------------------------------------------------------
+
+func TestGRPCServer_ListWorkers_ReturnsAllWorkers(t *testing.T) {
+	reg := NewRegistry()
+	srv := NewGRPCServer(reg)
+
+	reg.Register("w1", "localhost:9001")
+	reg.Register("w2", "localhost:9002")
+
+	resp, err := srv.ListWorkers(context.Background(), &workerpb.Empty{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(resp.Workers) != 2 {
+		t.Errorf("expected 2 workers, got %d", len(resp.Workers))
+	}
+}
+
+func TestGRPCServer_ListWorkers_EmptyRegistry(t *testing.T) {
+	reg := NewRegistry()
+	srv := NewGRPCServer(reg)
+
+	resp, err := srv.ListWorkers(context.Background(), &workerpb.Empty{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(resp.Workers) != 0 {
+		t.Errorf("expected 0 workers, got %d", len(resp.Workers))
+	}
+}
+
+func TestGRPCServer_ListWorkers_ContainsCorrectFields(t *testing.T) {
+	reg := NewRegistry()
+	srv := NewGRPCServer(reg)
+
+	reg.Register("w1", "localhost:9001")
+	reg.UpdateLoad("w1", 3)
+
+	resp, err := srv.ListWorkers(context.Background(), &workerpb.Empty{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(resp.Workers) != 1 {
+		t.Fatalf("expected 1 worker, got %d", len(resp.Workers))
+	}
+
+	w := resp.Workers[0]
+	if w.WorkerId != "w1" {
+		t.Errorf("expected worker_id w1, got %q", w.WorkerId)
+	}
+	if w.Load != 3 {
+		t.Errorf("expected load 3, got %d", w.Load)
+	}
+	if w.LastSeenUnix == 0 {
+		t.Error("expected non-zero last_seen_unix")
+	}
+}
+</file>
+
+<file path="internal/worker/registry_test.go">
+package worker
+
+import (
+	"net/http"
+	"net/http/httptest"
+	"testing"
+	"time"
+)
+
+// ---------------------------------------------------------------------------
+// Register
+// ---------------------------------------------------------------------------
+
+func TestRegister_StoresWorker(t *testing.T) {
+	r := NewRegistry()
+	r.Register("worker-1", "localhost:9001")
+
+	snapshot := r.List()
+	info, ok := snapshot["worker-1"]
+	if !ok {
+		t.Fatal("expected worker-1 to be in registry")
+	}
+	if info.Address != "localhost:9001" {
+		t.Errorf("expected address localhost:9001, got %s", info.Address)
+	}
+	if info.Load != 0 {
+		t.Errorf("expected initial load 0, got %d", info.Load)
+	}
+}
+
+func TestRegister_OverwritesExistingWorker(t *testing.T) {
+	r := NewRegistry()
+	r.Register("worker-1", "localhost:9001")
+	r.Register("worker-1", "localhost:9002") // re-register with new address
+
+	snapshot := r.List()
+	if snapshot["worker-1"].Address != "localhost:9002" {
+		t.Errorf("expected updated address localhost:9002, got %s", snapshot["worker-1"].Address)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// UpdateLoad
+// ---------------------------------------------------------------------------
+
+func TestUpdateLoad_UpdatesKnownWorker(t *testing.T) {
+	r := NewRegistry()
+	r.Register("worker-1", "localhost:9001")
+	r.UpdateLoad("worker-1", 5)
+
+	snapshot := r.List()
+	if snapshot["worker-1"].Load != 5 {
+		t.Errorf("expected load 5, got %d", snapshot["worker-1"].Load)
+	}
+}
+
+func TestUpdateLoad_RefreshesLastSeen(t *testing.T) {
+	r := NewRegistry()
+	r.Register("worker-1", "localhost:9001")
+	before := r.List()["worker-1"].LastSeen
+
+	time.Sleep(5 * time.Millisecond)
+	r.UpdateLoad("worker-1", 1)
+
+	after := r.List()["worker-1"].LastSeen
+	if !after.After(before) {
+		t.Error("expected LastSeen to be refreshed after UpdateLoad")
+	}
+}
+
+func TestUpdateLoad_UnknownWorkerIsNoop(t *testing.T) {
+	r := NewRegistry()
+	// Should not panic
+	r.UpdateLoad("ghost", 10)
+}
+
+// ---------------------------------------------------------------------------
+// List
+// ---------------------------------------------------------------------------
+
+func TestList_ReturnsSnapshot(t *testing.T) {
+	r := NewRegistry()
+	r.Register("w1", "localhost:9001")
+	r.Register("w2", "localhost:9002")
+
+	snapshot := r.List()
+	if len(snapshot) != 2 {
+		t.Errorf("expected 2 workers, got %d", len(snapshot))
+	}
+}
+
+func TestList_SnapshotIsIndependent(t *testing.T) {
+	r := NewRegistry()
+	r.Register("w1", "localhost:9001")
+
+	snapshot := r.List()
+	// Mutating the snapshot should not affect the registry.
+	delete(snapshot, "w1")
+
+	snapshot2 := r.List()
+	if _, ok := snapshot2["w1"]; !ok {
+		t.Error("deleting from snapshot should not affect the registry")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// PickWorker
+// ---------------------------------------------------------------------------
+
+func TestPickWorker_ReturnsEmptyWhenNoWorkers(t *testing.T) {
+	r := NewRegistry()
+	if id := r.PickWorker(); id != "" {
+		t.Errorf("expected empty string, got %q", id)
+	}
+}
+
+func TestPickWorker_ReturnsSingleWorker(t *testing.T) {
+	r := NewRegistry()
+	r.Register("w1", "localhost:9001")
+
+	if id := r.PickWorker(); id != "w1" {
+		t.Errorf("expected w1, got %q", id)
+	}
+}
+
+func TestPickWorker_PrefersLowestLoad(t *testing.T) {
+	r := NewRegistry()
+	r.Register("busy", "localhost:9001")
+	r.Register("idle", "localhost:9002")
+
+	r.UpdateLoad("busy", 10)
+	r.UpdateLoad("idle", 0)
+
+	if id := r.PickWorker(); id != "idle" {
+		t.Errorf("expected idle worker to be picked, got %q", id)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// CleanupExpired
+// ---------------------------------------------------------------------------
+
+func TestCleanupExpired_RemovesStaleWorker(t *testing.T) {
+	r := NewRegistry()
+	r.Register("stale", "localhost:9001")
+
+	// Manually backdate LastSeen past the TTL.
+	r.mu.Lock()
+	r.workers["stale"].LastSeen = time.Now().Add(-(workerTTL + time.Second))
+	r.mu.Unlock()
+
+	r.CleanupExpired()
+
+	snapshot := r.List()
+	if _, ok := snapshot["stale"]; ok {
+		t.Error("expected stale worker to be removed")
+	}
+}
+
+func TestCleanupExpired_KeepsFreshWorker(t *testing.T) {
+	r := NewRegistry()
+	r.Register("fresh", "localhost:9001")
+
+	r.CleanupExpired()
+
+	snapshot := r.List()
+	if _, ok := snapshot["fresh"]; !ok {
+		t.Error("expected fresh worker to remain in registry")
+	}
+}
+
+func TestCleanupExpired_OnlyRemovesExpired(t *testing.T) {
+	r := NewRegistry()
+	r.Register("stale", "localhost:9001")
+	r.Register("fresh", "localhost:9002")
+
+	r.mu.Lock()
+	r.workers["stale"].LastSeen = time.Now().Add(-(workerTTL + time.Second))
+	r.mu.Unlock()
+
+	r.CleanupExpired()
+
+	snapshot := r.List()
+	if _, ok := snapshot["stale"]; ok {
+		t.Error("stale worker should have been removed")
+	}
+	if _, ok := snapshot["fresh"]; !ok {
+		t.Error("fresh worker should still be present")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// DispatchJob
+// ---------------------------------------------------------------------------
+
+func TestDispatchJob_SucceedsWhenWorkerResponds200(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			t.Errorf("expected POST, got %s", r.Method)
+		}
+		if r.URL.Path != "/dispatch" {
+			t.Errorf("expected /dispatch, got %s", r.URL.Path)
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	r := NewRegistry()
+	// Strip the "http://" prefix — registry prepends it internally.
+	r.Register("w1", server.Listener.Addr().String())
+
+	err := r.DispatchJob("w1", "job-1", "email", map[string]string{"to": "a@b.com"})
+	if err != nil {
+		t.Errorf("expected no error, got %v", err)
+	}
+}
+
+func TestDispatchJob_FailsWhenWorkerRespondsNon200(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer server.Close()
+
+	r := NewRegistry()
+	r.Register("w1", server.Listener.Addr().String())
+
+	err := r.DispatchJob("w1", "job-1", "email", nil)
+	if err == nil {
+		t.Error("expected error for non-200 response")
+	}
+}
+
+func TestDispatchJob_FailsForUnknownWorker(t *testing.T) {
+	r := NewRegistry()
+	err := r.DispatchJob("ghost", "job-1", "email", nil)
+	if err == nil {
+		t.Error("expected error for unknown worker")
+	}
+}
+
+func TestDispatchJob_FailsWhenWorkerHasNoAddress(t *testing.T) {
+	r := NewRegistry()
+	r.Register("w1", "") // no address
+
+	err := r.DispatchJob("w1", "job-1", "email", nil)
+	if err == nil {
+		t.Error("expected error when worker has no address")
+	}
 }
 </file>
 
@@ -241,62 +1219,6 @@ func main() {
 
 		msg.Ack(false)
 	}
-}
-</file>
-
-<file path="internal/config/config.go">
-package config
-
-import (
-	"fmt"
-	"os"
-)
-
-type Config struct {
-	RabbitMQURL        string
-	RabbitMQQueue      string
-	RabbitMQDLQ        string
-	APIHTTPPort        string
-	APIGRPCPort        string
-	APIGRPCAddr        string
-	WorkerHost         string
-	WorkerDispatchPort string
-}
-
-func Load() *Config {
-	return &Config{
-		RabbitMQURL:        getEnv("RABBITMQ_URL", "amqp://guest:guest@localhost:5672/"),
-		RabbitMQQueue:      getEnv("RABBITMQ_QUEUE", "jobs"),
-		RabbitMQDLQ:        getEnv("RABBITMQ_DLQ", "jobs.dlq"),
-		APIHTTPPort:        getEnv("API_HTTP_PORT", "8081"),
-		APIGRPCPort:        getEnv("API_GRPC_PORT", "50051"),
-		APIGRPCAddr:        getEnv("API_GRPC_ADDR", "localhost:50051"),
-		WorkerHost:         getEnv("WORKER_HOST", "localhost"),
-		WorkerDispatchPort: getEnv("WORKER_DISPATCH_PORT", "9001"),
-	}
-}
-
-func (c *Config) HTTPAddr() string {
-	return fmt.Sprintf(":%s", c.APIHTTPPort)
-}
-
-func (c *Config) GRPCAddr() string {
-	return fmt.Sprintf(":%s", c.APIGRPCPort)
-}
-
-func (c *Config) DispatchAddr() string {
-	return fmt.Sprintf(":%s", c.WorkerDispatchPort)
-}
-
-func (c *Config) WorkerDispatchAddress() string {
-	return fmt.Sprintf("%s:%s", c.WorkerHost, c.WorkerDispatchPort)
-}
-
-func getEnv(key, defaultVal string) string {
-	if val := os.Getenv(key); val != "" {
-		return val
-	}
-	return defaultVal
 }
 </file>
 
@@ -948,6 +1870,62 @@ func file_proto_worker_proto_init() {
 }
 </file>
 
+<file path="internal/config/config.go">
+package config
+
+import (
+	"fmt"
+	"os"
+)
+
+type Config struct {
+	RabbitMQURL        string
+	RabbitMQQueue      string
+	RabbitMQDLQ        string
+	APIHTTPPort        string
+	APIGRPCPort        string
+	APIGRPCAddr        string
+	WorkerHost         string
+	WorkerDispatchPort string
+}
+
+func Load() *Config {
+	return &Config{
+		RabbitMQURL:        getEnv("RABBITMQ_URL", "amqp://guest:guest@localhost:5672/"),
+		RabbitMQQueue:      getEnv("RABBITMQ_QUEUE", "jobs"),
+		RabbitMQDLQ:        getEnv("RABBITMQ_DLQ", "jobs.dlq"),
+		APIHTTPPort:        getEnv("API_HTTP_PORT", "8081"),
+		APIGRPCPort:        getEnv("API_GRPC_PORT", "50051"),
+		APIGRPCAddr:        getEnv("API_GRPC_ADDR", "localhost:50051"),
+		WorkerHost:         getEnv("WORKER_HOST", "localhost"),
+		WorkerDispatchPort: getEnv("WORKER_DISPATCH_PORT", "9001"),
+	}
+}
+
+func (c *Config) HTTPAddr() string {
+	return fmt.Sprintf(":%s", c.APIHTTPPort)
+}
+
+func (c *Config) GRPCAddr() string {
+	return fmt.Sprintf(":%s", c.APIGRPCPort)
+}
+
+func (c *Config) DispatchAddr() string {
+	return fmt.Sprintf(":%s", c.WorkerDispatchPort)
+}
+
+func (c *Config) WorkerDispatchAddress() string {
+	return fmt.Sprintf("%s:%s", c.WorkerHost, c.WorkerDispatchPort)
+}
+
+func getEnv(key, defaultVal string) string {
+	if val := os.Getenv(key); val != "" {
+		return val
+	}
+	return defaultVal
+}
+</file>
+
 <file path="internal/worker/grpc_server.go">
 package worker
 
@@ -1067,12 +2045,14 @@ services:
     environment:
       RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER}
       RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASS}
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
     healthcheck:
       test: ["CMD", "rabbitmq-diagnostics", "ping"]
       interval: 5s
       timeout: 5s
-      retries: 15
-      start_period: 30s
+      retries: 20
+      start_period: 60s
 
   api:
     build:
@@ -1111,6 +2091,30 @@ services:
         condition: service_healthy
       api:
         condition: service_started
+
+volumes:
+  rabbitmq_data:
+</file>
+
+<file path="go.mod">
+module jobqueue
+
+go 1.24.5
+
+require github.com/rabbitmq/amqp091-go v1.10.0
+
+require (
+	github.com/google/uuid v1.6.0
+	google.golang.org/grpc v1.78.0
+	google.golang.org/protobuf v1.36.11
+)
+
+require (
+	golang.org/x/net v0.47.0 // indirect
+	golang.org/x/sys v0.38.0 // indirect
+	golang.org/x/text v0.31.0 // indirect
+	google.golang.org/genproto/googleapis/rpc v0.0.0-20251029180050-ab9386a59fda // indirect
+)
 </file>
 
 <file path="internal/queue/rabbitmq.go">
@@ -1129,20 +2133,20 @@ type RabbitMQ struct {
 	queue string
 }
 
-// NewRabbitMQ connects to RabbitMQ, retrying up to 10 times with a 3 second
-// delay between attempts. This handles the case where RabbitMQ is still
-// starting up when the API or worker container launches.
+// NewRabbitMQ connects to RabbitMQ, retrying up to 20 times with a 5 second
+// delay between attempts. RabbitMQ can take 45-60s to fully start inside
+// Docker, so 20 × 5s = 100s gives it plenty of headroom.
 func NewRabbitMQ(cfg *Config) (*RabbitMQ, error) {
 	var conn *amqp.Connection
 	var err error
 
-	for i := 1; i <= 10; i++ {
+	for i := 1; i <= 20; i++ {
 		conn, err = amqp.Dial(cfg.URL)
 		if err == nil {
 			break
 		}
-		log.Printf("RabbitMQ not ready (attempt %d/10): %v — retrying in 3s...", i, err)
-		time.Sleep(3 * time.Second)
+		log.Printf("RabbitMQ not ready (attempt %d/20): %v — retrying in 5s...", i, err)
+		time.Sleep(5 * time.Second)
 	}
 	if err != nil {
 		return nil, err
@@ -1241,441 +2245,6 @@ func (r *RabbitMQ) Close() error {
 	}
 	return r.conn.Close()
 }
-</file>
-
-<file path="go.mod">
-module jobqueue
-
-go 1.24.5
-
-require github.com/rabbitmq/amqp091-go v1.10.0
-
-require (
-	github.com/google/uuid v1.6.0
-	google.golang.org/grpc v1.78.0
-	google.golang.org/protobuf v1.36.11
-)
-
-require (
-	golang.org/x/net v0.47.0 // indirect
-	golang.org/x/sys v0.38.0 // indirect
-	golang.org/x/text v0.31.0 // indirect
-	google.golang.org/genproto/googleapis/rpc v0.0.0-20251029180050-ab9386a59fda // indirect
-)
-</file>
-
-<file path="README.md">
-# Hermes
-
-A distributed job processing system built with Go, featuring a gRPC control plane, direct HTTP job dispatch, RabbitMQ-backed reliability, and a real-time worker registry.
-
-[![Go Version](https://img.shields.io/badge/Go-1.24+-00ADD8?style=flat&logo=go)](https://golang.org/)
-[![RabbitMQ](https://img.shields.io/badge/RabbitMQ-3.13-FF6600?style=flat&logo=rabbitmq)](https://www.rabbitmq.com/)
-[![gRPC](https://img.shields.io/badge/gRPC-1.78-244c5a?style=flat&logo=grpc)](https://grpc.io/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-
----
-
-## Overview
-
-Hermes is a production-grade distributed job queue designed around a **control plane / data plane** separation. Workers self-register via gRPC, send continuous heartbeats, and receive jobs either through direct HTTP dispatch or via a durable RabbitMQ queue as a fallback. The system is built to be operationally simple — no external coordination service required.
-
----
-
-## Screenshots
-
-> _Real-time worker and job monitoring dashboard_
-
-<!-- Add after dashboard is built -->
-![Dashboard](docs/screenshots/dashboard.png)
-
-> _Landing page_
-
-<!-- Add after landing page is built -->
-![Landing page](docs/screenshots/landing.png)
-
----
-
-## Architecture
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│                         CLIENT                              │
-│              curl / HTTP / Any HTTP client                  │
-└───────────────────────────┬─────────────────────────────────┘
-                            │  HTTP
-                            ▼
-┌─────────────────────────────────────────────────────────────┐
-│                      API SERVER :8081                       │
-│                                                             │
-│   POST /jobs ──► Registry.PickWorker()                      │
-│                         │                                   │
-│                  worker alive?                              │
-│                  ┌──────┴──────┐                            │
-│                 YES            NO                           │
-│                  │              │                           │
-│                  ▼              ▼                           │
-│           HTTP Dispatch    RabbitMQ Queue                   │
-│                                                             │
-│   GET /workers ──► Registry.List() snapshot                 │
-│                                                             │
-│   gRPC :50051 ◄── Workers (Register / Heartbeat)            │
-└───────────┬─────────────────────────┬───────────────────────┘
-            │ gRPC                    │ HTTP Dispatch
-            │ (Register/Heartbeat)    │ POST /dispatch
-            ▼                        ▼
-┌───────────────────┐      ┌───────────────────┐
-│   WORKER NODE 1   │      │   WORKER NODE 2   │
-│   :9001           │      │   :9002           │
-│                   │      │                   │
-│  ┌─────────────┐  │      │  ┌─────────────┐  │
-│  │  Heartbeat  │  │      │  │  Heartbeat  │  │
-│  │  (5s tick)  │  │      │  │  (5s tick)  │  │
-│  └─────────────┘  │      │  └─────────────┘  │
-│                   │      │                   │
-│  ┌─────────────┐  │      │  ┌─────────────┐  │
-│  │  RabbitMQ   │  │      │  │  RabbitMQ   │  │
-│  │  Consumer   │  │      │  │  Consumer   │  │
-│  └─────────────┘  │      │  └─────────────┘  │
-└───────────────────┘      └───────────────────┘
-            │                        │
-            └───────────┬────────────┘
-                        │ AMQP consume
-                        ▼
-        ┌───────────────────────────┐
-        │        RabbitMQ           │
-        │   jobs queue + DLQ        │
-        │   :5672  │  UI :15672     │
-        └───────────────────────────┘
-```
-
-### Control Plane (gRPC — Worker → API)
-Workers initiate all control traffic. On startup each worker dials the API's gRPC server, registers itself with its dispatch address, then enters a heartbeat loop. The API maintains an in-memory registry of alive workers and removes any that haven't heartbeated within 15 seconds.
-
-### Data Plane (HTTP — API → Worker)
-When a job arrives the API picks an alive worker from the registry and POSTs the job directly to that worker's `/dispatch` endpoint. If no workers are alive, or if dispatch fails, the job is published to RabbitMQ so it will be processed as soon as a worker comes up.
-
-### Reliability Layer (RabbitMQ)
-Every worker also consumes from RabbitMQ. Jobs that enter the queue are retried up to 3 times. After 3 failed attempts they are moved to a Dead Letter Queue (DLQ) for inspection.
-
----
-
-## Features
-
-- **Direct dispatch** — API pushes jobs straight to a worker over HTTP; no queue round-trip when workers are available
-- **Automatic failover** — falls back to RabbitMQ transparently when no workers are alive
-- **Worker registry** — real-time in-memory registry with TTL-based expiry (15s)
-- **Heartbeat monitoring** — workers report load status (idle / busy) every 5 seconds
-- **Retry logic** — failed queue jobs retry up to 3 times before moving to DLQ
-- **Dead Letter Queue** — permanent failures are captured for inspection, never silently dropped
-- **Multi-worker** — run as many worker instances as needed; each registers independently
-- **Visibility API** — `GET /workers` gives a live JSON snapshot of the fleet
-
----
-
-## Tech Stack
-
-| Component | Technology |
-|-----------|-----------|
-| Language | Go 1.24+ |
-| Control plane RPC | gRPC + Protocol Buffers |
-| Message broker | RabbitMQ 3.13 (AMQP 0.9.1) |
-| Job dispatch | HTTP/JSON |
-| Worker coordination | In-memory registry with TTL |
-| Infrastructure | Docker Compose |
-
----
-
-## Project Structure
-
-```
-Hermes/
-├── cmd/
-│   ├── api/
-│   │   └── main.go              # API server — HTTP + gRPC
-│   └── worker/
-│       ├── worker_main/
-│       │   └── main.go          # Worker node
-│       └── dlq_consumer/
-│           └── main.go          # Dead-letter queue inspector
-├── internal/
-│   ├── jobs/
-│   │   └── job.go               # Job struct
-│   ├── queue/
-│   │   ├── config.go            # RabbitMQ config
-│   │   ├── queue.go             # Queue interface
-│   │   └── rabbitmq.go          # RabbitMQ implementation + DLQ setup
-│   └── worker/
-│       ├── registry.go          # In-memory worker registry
-│       └── grpc_server.go       # gRPC handler (Register, Heartbeat, ListWorkers)
-├── proto/
-│   ├── worker.proto             # Protobuf definitions
-│   └── workerpb/
-│       ├── worker.pb.go         # Generated message types
-│       └── worker_grpc.pb.go    # Generated gRPC stubs
-├── scripts/
-│   ├── publisher/publish.go     # Manual job publisher (dev utility)
-│   └── consumer/consume.go      # Manual queue consumer (dev utility)
-├── docker-compose.yml
-├── go.mod
-└── README.md
-```
-
----
-
-## Quick Start
-
-### Prerequisites
-
-- [Go 1.24+](https://golang.org/dl/)
-- [Docker](https://www.docker.com/) (for RabbitMQ)
-
-### 1. Start RabbitMQ
-
-```bash
-docker-compose up -d
-```
-
-### 2. Start the API server
-
-```bash
-go run ./cmd/api/main.go
-```
-
-```
-gRPC server listening on :50051...
-API listening on :8081...
-```
-
-### 3. Start a worker
-
-```bash
-go run ./cmd/worker/worker_main/main.go
-```
-
-```
-HTTP dispatch server listening on :9001
-Worker registered | id=<uuid> | dispatch=http://localhost:9001
-Worker ready — waiting for jobs
-```
-
-### 4. Run a second worker (optional)
-
-```bash
-go run ./cmd/worker/worker_main/main.go --port 9002
-```
-
-### 5. Submit a job
-
-```bash
-curl -X POST http://localhost:8081/jobs \
-  -H "Content-Type: application/json" \
-  -d '{"type":"email","payload":{"to":"user@example.com","subject":"Hello"}}'
-```
-
-**Response:**
-```json
-{
-  "job": {
-    "id": "1d3de6cf-f005-490d-aeae-748c8c0949f9",
-    "type": "email",
-    "payload": { "to": "user@example.com", "subject": "Hello" },
-    "attempts": 0
-  },
-  "routed": "direct",
-  "worker_id": "8a4605e1-cd04-42d3-8df7-2a3401b47546"
-}
-```
-
-### 6. Inspect the worker fleet
-
-```bash
-curl http://localhost:8081/workers
-```
-
-```json
-{
-  "count": 1,
-  "workers": [
-    {
-      "worker_id": "8a4605e1-cd04-42d3-8df7-2a3401b47546",
-      "last_seen_unix": 1741614789,
-      "load": 0,
-      "status": "idle"
-    }
-  ]
-}
-```
-
----
-
-## API Reference
-
-### `POST /jobs`
-
-Submit a job for processing.
-
-**Request body:**
-```json
-{
-  "type": "string",
-  "payload": {}
-}
-```
-
-**Response `202 Accepted` — direct dispatch:**
-```json
-{
-  "job": { "id": "...", "type": "...", "payload": {}, "attempts": 0 },
-  "routed": "direct",
-  "worker_id": "..."
-}
-```
-
-**Response `202 Accepted` — queued (no alive workers):**
-```json
-{
-  "job": { "id": "...", "type": "...", "payload": {}, "attempts": 0 },
-  "routed": "queue",
-  "note": "no alive workers, job queued"
-}
-```
-
----
-
-### `GET /workers`
-
-Returns a live snapshot of all registered workers.
-
-**Response:**
-```json
-{
-  "count": 2,
-  "workers": [
-    {
-      "worker_id": "8a4605e1-...",
-      "last_seen_unix": 1741614789,
-      "load": 0,
-      "status": "idle"
-    },
-    {
-      "worker_id": "37a2134a-...",
-      "last_seen_unix": 1741614791,
-      "load": 1,
-      "status": "busy"
-    }
-  ]
-}
-```
-
----
-
-## Configuration
-
-| Setting | Location | Default | Description |
-|---------|----------|---------|-------------|
-| RabbitMQ URL | `cmd/api/main.go` | `amqp://guest:guest@localhost:5672/` | AMQP connection string |
-| API HTTP port | `cmd/api/main.go` | `:8081` | HTTP API port |
-| gRPC port | `cmd/api/main.go` | `:50051` | Worker control plane port |
-| Worker dispatch port | `--port` flag | `9001` | Per-worker HTTP dispatch port |
-| Heartbeat interval | `cmd/worker/worker_main/main.go` | `5s` | How often workers heartbeat |
-| Worker TTL | `internal/worker/registry.go` | `15s` | Time before a silent worker is removed |
-| Max job attempts | `cmd/worker/worker_main/main.go` | `3` | Retries before DLQ |
-
----
-
-## How Job Routing Works
-
-```
-POST /jobs
-    │
-    ▼
-Registry.PickWorker()
-    │
-    ├── worker found ──► HTTP POST to worker /dispatch
-    │                         │
-    │                    success ──► 202 { routed: "direct" }
-    │                         │
-    │                    failure ──► publish to RabbitMQ
-    │                                    │
-    │                              202 { routed: "queue" }
-    │
-    └── no workers ──► publish to RabbitMQ
-                            │
-                       202 { routed: "queue" }
-```
-
----
-
-## Worker Lifecycle
-
-```
-startup
-   │
-   ├─ connect to RabbitMQ
-   ├─ start HTTP dispatch server
-   ├─ connect to API gRPC :50051
-   ├─ Register("<uuid>@localhost:<port>")
-   │
-   ├─ heartbeat loop (every 5s) ─────────────────────────────┐
-   │                                                         │
-   └─ RabbitMQ consumer loop                                 │
-           │                                                 │
-           ├─ job arrives ──► process ──► Ack                │
-           │                                                 │
-           └─ job fails ──► increment attempts               │
-                   │                                         │
-                   ├─ attempts < 3 ──► Nack + re-publish     │
-                   │                                         │
-                   └─ attempts == 3 ──► DLQ                  │
-                                                             │
-                                        ◄────────────────────┘
-```
-
----
-
-## Running the DLQ Consumer
-
-To inspect jobs that have exhausted all retries:
-
-```bash
-go run ./cmd/worker/dlq_consumer/main.go
-```
-
----
-
-## RabbitMQ Management UI
-
-Access the RabbitMQ dashboard at [http://localhost:15672](http://localhost:15672)
-
-- **Username:** `guest`
-- **Password:** `guest`
-
-You can inspect queue depths, message rates, and dead-lettered jobs here.
-
----
-
-## Roadmap
-
-- [ ] Web dashboard — real-time worker and job monitoring UI
-- [ ] Landing page
-- [ ] Docker multi-stage build + single `docker-compose up` startup
-- [ ] Metrics endpoint (Prometheus-compatible)
-- [ ] Job status tracking (pending / running / complete / failed)
-- [ ] Priority queues
-- [ ] Distributed registry (Redis) for multi-host deployments
-
----
-
-## Author
-
-Built by **Philip Machar**
-
----
-
-## License
-
-MIT
 </file>
 
 <file path="internal/worker/registry.go">
@@ -1824,13 +2393,642 @@ func (r *Registry) CleanupExpired() {
 }
 </file>
 
+<file path="README.md">
+# Hermes
+
+A production-grade distributed job processing system built in Go — featuring a gRPC control plane, intelligent load-balanced HTTP dispatch, RabbitMQ-backed durability, graceful shutdown, and a fully containerised deployment.
+
+[![Go Version](https://img.shields.io/badge/Go-1.24+-00ADD8?style=flat&logo=go)](https://golang.org/)
+[![RabbitMQ](https://img.shields.io/badge/RabbitMQ-3.13-FF6600?style=flat&logo=rabbitmq)](https://www.rabbitmq.com/)
+[![gRPC](https://img.shields.io/badge/gRPC-1.78-244c5a?style=flat&logo=grpc)](https://grpc.io/)
+[![Docker](https://img.shields.io/badge/Docker-Compose-2496ED?style=flat&logo=docker)](https://docs.docker.com/compose/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
+---
+
+## Overview
+
+Hermes is built around a **control plane / data plane separation** — the same architectural principle used by systems like Kubernetes and Envoy. Workers self-register via gRPC, continuously heartbeat their load status, and receive jobs either through direct HTTP dispatch (the fast path) or via a durable RabbitMQ queue (the reliable fallback). The entire system starts with a single `docker-compose up`.
+
+**What makes it interesting:**
+
+- No external coordination service. The registry is in-memory with TTL-based expiry, kept consistent by the heartbeat protocol.
+- Jobs are never dropped. If direct dispatch fails, they fall back to RabbitMQ automatically — no retry logic needed at the client.
+- Workers report real load metrics. The router picks the least-loaded worker, not just any alive one.
+- The system shuts down cleanly. Both API and workers drain in-flight work before exiting.
+
+---
+
+## Screenshots
+
+> _Real-time worker and job monitoring dashboard_
+
+<!-- Add after dashboard is built -->
+![Dashboard](docs/screenshots/dashboard.png)
+
+> _Landing page_
+
+<!-- Add after landing page is built -->
+![Landing](docs/screenshots/landing.png)
+
+---
+
+## Architecture
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│                          CLIENT                              │
+│               curl / HTTP / Any HTTP client                  │
+└────────────────────────────┬─────────────────────────────────┘
+                             │  HTTP
+                             ▼
+┌──────────────────────────────────────────────────────────────┐
+│                     API SERVER  :8081                        │
+│                                                              │
+│   POST /jobs  ──►  Registry.PickWorker()                     │
+│                          │                                   │
+│                   least-loaded worker?                       │
+│                   ┌──────┴──────┐                            │
+│                  YES            NO                           │
+│                   │              │                           │
+│                   ▼              ▼                           │
+│           HTTP Dispatch     RabbitMQ Queue                   │
+│           (fast path)       (reliable fallback)              │
+│                                                              │
+│   GET /workers  ──►  Registry.List() snapshot                │
+│                                                              │
+│   gRPC :50051  ◄──  Workers (Register / Heartbeat)           │
+└────────┬─────────────────────────┬───────────────────────────┘
+         │ gRPC                    │ HTTP
+         │ Register / Heartbeat    │ POST /dispatch
+         ▼                        ▼
+┌──────────────────┐     ┌──────────────────┐
+│  WORKER NODE 1   │     │  WORKER NODE 2   │
+│  :9001           │     │  :9002           │
+│                  │     │                  │
+│  Heartbeat 5s    │     │  Heartbeat 5s    │
+│  RabbitMQ consumer     │  RabbitMQ consumer
+└────────┬─────────┘     └────────┬─────────┘
+         └──────────┬─────────────┘
+                    │ AMQP
+                    ▼
+       ┌────────────────────────┐
+       │       RabbitMQ         │
+       │  jobs queue + DLQ      │
+       │  :5672  │  UI :15672   │
+       └────────────────────────┘
+```
+
+### Control plane — gRPC (Worker → API)
+
+Workers initiate all control traffic. On startup each worker dials the API's gRPC server, registers its dispatch address, then enters a heartbeat loop every 5 seconds. The API maintains an in-memory registry and evicts any worker that hasn't heartbeated within 15 seconds. This means the API always has a consistent, live view of the fleet without polling.
+
+### Data plane — HTTP (API → Worker)
+
+When a job arrives the API scores every alive worker by current load and POSTs the job directly to the least-loaded one's `/dispatch` endpoint. No queue round-trip, no broker latency. If no workers are alive, or if dispatch fails for any reason, the job is published to RabbitMQ so it will be picked up as soon as capacity is available.
+
+### Reliability layer — RabbitMQ
+
+Every worker also consumes from the same RabbitMQ queue. Jobs that cannot be dispatched directly, or that fail during processing, are retried up to 3 times with exponential nack. After 3 failed attempts they are moved to a Dead Letter Queue for inspection — nothing is silently dropped.
+
+---
+
+## Key Design Decisions
+
+**Why gRPC for the control plane and HTTP for dispatch?**
+Control messages (register, heartbeat) are low-volume, structured, and benefit from the strong typing and streaming primitives of gRPC. Job dispatch is higher-volume, payload-heavy, and simpler to implement and debug over plain HTTP/JSON. Separating the two planes also means you can evolve each independently.
+
+**Why in-memory registry instead of Redis?**
+For a single-node deployment, an in-memory registry with TTL-based expiry is simpler, faster, and has no external dependency. The heartbeat protocol provides the same consistency guarantees as a distributed cache — if a worker stops heartbeating, it's evicted within one TTL window. Redis becomes the right call when you need the registry to survive API restarts or scale across multiple API nodes.
+
+**Why least-loaded routing instead of round-robin?**
+Workers report a live load counter with every heartbeat. Routing to the least-loaded worker is a 5-line change that meaningfully reduces tail latency under uneven workloads — and is a more accurate reflection of real capacity than a simple counter.
+
+---
+
+## Features
+
+| Feature | Detail |
+|---|---|
+| Direct dispatch | API pushes jobs straight to a worker over HTTP — no queue latency when workers are available |
+| Intelligent routing | Least-loaded worker selection based on live heartbeat metrics |
+| Automatic failover | Falls back to RabbitMQ transparently when no workers are alive or dispatch fails |
+| Worker registry | In-memory registry with TTL-based eviction (15 s) |
+| Heartbeat monitoring | Workers report load and status every 5 seconds |
+| Retry logic | Failed queue jobs retry up to 3 times before DLQ |
+| Dead Letter Queue | Failed jobs are captured for inspection, never silently dropped |
+| Graceful shutdown | API and workers drain in-flight work on SIGINT / SIGTERM before exiting |
+| Environment-driven config | No hardcoded credentials — everything configurable via environment variables |
+| Single-command deployment | `docker-compose up --build` starts RabbitMQ, API, and worker with health-checked ordering |
+| Multi-worker | Scale horizontally by starting additional worker instances — each self-registers |
+| Visibility API | `GET /workers` returns a live JSON snapshot of the fleet with load and status |
+
+---
+
+## Tech Stack
+
+| Component | Technology |
+|---|---|
+| Language | Go 1.24+ |
+| Control plane | gRPC + Protocol Buffers |
+| Message broker | RabbitMQ 3.13 (AMQP 0.9.1) |
+| Job dispatch | HTTP/JSON |
+| Worker coordination | In-memory registry with TTL |
+| Infrastructure | Docker Compose (multi-stage builds) |
+
+---
+
+## Project Structure
+
+```
+hermes/
+├── cmd/
+│   ├── api/
+│   │   └── main.go               # API server — HTTP :8081 + gRPC :50051
+│   └── worker/
+│       ├── worker_main/
+│       │   └── main.go           # Worker node — dispatch server + consumer
+│       └── dlq_consumer/
+│           └── main.go           # Dead-letter queue inspector
+├── internal/
+│   ├── config/
+│   │   └── config.go             # Environment-driven configuration
+│   ├── jobs/
+│   │   └── job.go                # Job struct
+│   ├── queue/
+│   │   ├── config.go             # RabbitMQ topology config
+│   │   ├── queue.go              # Queue interface
+│   │   └── rabbitmq.go           # RabbitMQ implementation, DLQ setup, retry loop
+│   └── worker/
+│       ├── registry.go           # In-memory registry with least-loaded routing
+│       └── grpc_server.go        # gRPC handler — Register, Heartbeat, ListWorkers
+├── proto/
+│   ├── worker.proto              # Protobuf service definition
+│   └── workerpb/
+│       ├── worker.pb.go          # Generated message types
+│       └── worker_grpc.pb.go     # Generated gRPC stubs
+├── docker/
+│   ├── Dockerfile.api            # Multi-stage build for API
+│   └── Dockerfile.worker         # Multi-stage build for worker
+├── docker-compose.yml
+├── .env.example                  # Config template — copy to .env
+├── go.mod
+└── README.md
+```
+
+---
+
+## Quick Start
+
+### Option A — Docker (recommended)
+
+```bash
+git clone https://github.com/yourname/hermes
+cd hermes
+cp .env.example .env
+docker-compose up --build
+```
+
+RabbitMQ starts first with a health check. The API waits for RabbitMQ to be ready. The worker waits for both. Everything comes up in the right order automatically.
+
+### Option B — Local development
+
+**Prerequisites:** Go 1.24+, Docker (for RabbitMQ)
+
+```bash
+# 1. Start RabbitMQ only
+docker-compose up -d rabbitmq
+
+# 2. Start the API
+go run ./cmd/api/main.go
+
+# 3. Start a worker (separate terminal)
+go run ./cmd/worker/worker_main/main.go
+
+# 4. Optionally start a second worker
+WORKER_DISPATCH_PORT=9002 go run ./cmd/worker/worker_main/main.go
+```
+
+### Test it
+
+```bash
+# Check the worker fleet
+curl http://localhost:8081/workers
+
+# Submit a job
+curl -X POST http://localhost:8081/jobs \
+  -H "Content-Type: application/json" \
+  -d '{"type":"email","payload":{"to":"user@example.com","subject":"Hello"}}'
+```
+
+**Direct dispatch response (worker alive):**
+```json
+{
+  "job": {
+    "id": "1d3de6cf-f005-490d-aeae-748c8c0949f9",
+    "type": "email",
+    "payload": { "to": "user@example.com", "subject": "Hello" },
+    "attempts": 0
+  },
+  "routed": "direct",
+  "worker_id": "8a4605e1-cd04-42d3-8df7-2a3401b47546"
+}
+```
+
+**Fallback response (no workers available):**
+```json
+{
+  "job": { ... },
+  "routed": "queue",
+  "note": "no alive workers, job queued"
+}
+```
+
+---
+
+## API Reference
+
+### `POST /jobs`
+
+Submit a job for processing.
+
+**Request:**
+```json
+{
+  "type": "email",
+  "payload": { "to": "user@example.com" }
+}
+```
+
+**Response `202 Accepted`:**
+```json
+{
+  "job": { "id": "...", "type": "email", "payload": {}, "attempts": 0 },
+  "routed": "direct",
+  "worker_id": "8a4605e1-..."
+}
+```
+
+`routed` is either `"direct"` (dispatched to a live worker) or `"queue"` (published to RabbitMQ).
+
+---
+
+### `GET /workers`
+
+Live snapshot of the worker fleet.
+
+**Response:**
+```json
+{
+  "count": 2,
+  "workers": [
+    {
+      "worker_id": "8a4605e1-...",
+      "last_seen_unix": 1741614789,
+      "load": 0,
+      "status": "idle"
+    },
+    {
+      "worker_id": "37a2134a-...",
+      "last_seen_unix": 1741614791,
+      "load": 2,
+      "status": "busy"
+    }
+  ]
+}
+```
+
+---
+
+## Configuration
+
+All configuration is via environment variables. Copy `.env.example` to `.env` and fill in values.
+
+| Variable | Default | Description |
+|---|---|---|
+| `RABBITMQ_URL` | `amqp://guest:guest@localhost:5672/` | Full AMQP connection string |
+| `RABBITMQ_USER` | `guest` | RabbitMQ username (used by Docker Compose) |
+| `RABBITMQ_PASS` | `guest` | RabbitMQ password (used by Docker Compose) |
+| `RABBITMQ_QUEUE` | `jobs` | Main job queue name |
+| `RABBITMQ_DLQ` | `jobs.dlq` | Dead letter queue name |
+| `API_HTTP_PORT` | `8081` | API HTTP port |
+| `API_GRPC_PORT` | `50051` | gRPC control plane port |
+| `API_GRPC_ADDR` | `localhost:50051` | Address workers dial to register |
+| `WORKER_HOST` | `localhost` | Hostname workers advertise for dispatch (set to `worker` in Docker) |
+| `WORKER_DISPATCH_PORT` | `9001` | Port the worker's HTTP dispatch server listens on |
+
+---
+
+## How Job Routing Works
+
+```
+POST /jobs
+    │
+    ▼
+Registry.PickWorker()  ←  scores all alive workers by current load
+    │
+    ├── worker found
+    │       │
+    │       ▼
+    │   HTTP POST → worker /dispatch
+    │       │
+    │       ├── 200 OK  →  202 { routed: "direct", worker_id: "..." }
+    │       │
+    │       └── error   →  publish to RabbitMQ
+    │                          │
+    │                      202 { routed: "queue", note: "worker unreachable" }
+    │
+    └── no workers alive  →  publish to RabbitMQ
+                                   │
+                               202 { routed: "queue", note: "no alive workers" }
+```
+
+---
+
+## Worker Lifecycle
+
+```
+startup
+   │
+   ├─ connect to RabbitMQ (retry loop, up to 10 attempts)
+   ├─ start HTTP /dispatch server
+   ├─ dial API gRPC :50051
+   ├─ Register("<uuid>@<host>:<port>")
+   │
+   ├─ heartbeat goroutine (every 5 s) ─────────────────────────┐
+   │       sends: worker_id, load counter                      │
+   │                                                           │
+   ├─ RabbitMQ consumer goroutine                              │
+   │       │                                                   │
+   │       ├─ message received → process → Ack                 │
+   │       │                                                   │
+   │       └─ failure → increment attempts                     │
+   │               │                                           │
+   │               ├─ attempts < 3 → Nack (re-queued)          │
+   │               │                                           │
+   │               └─ attempts == 3 → Dead Letter Queue        │
+   │                                                           │
+   └─ SIGINT / SIGTERM received                                │
+           │                                                   │
+           ├─ HTTP server: graceful shutdown (5 s timeout)  ◄──┘
+           ├─ RabbitMQ connection: close
+           └─ gRPC connection: close
+```
+
+---
+
+## Graceful Shutdown
+
+Both the API and worker handle `SIGINT` and `SIGTERM`. On receiving a signal:
+
+- The **API** stops accepting new HTTP requests, waits up to 5 seconds for in-flight handlers to complete, then stops the gRPC server and closes the RabbitMQ connection.
+- Each **worker** shuts down its dispatch HTTP server, closes its RabbitMQ consumer, and closes its gRPC connection to the API.
+
+A rolling deployment or `docker-compose down` will not drop in-flight jobs.
+
+---
+
+## Running the DLQ Consumer
+
+To inspect jobs that have exhausted all retries:
+
+```bash
+go run ./cmd/worker/dlq_consumer/main.go
+```
+
+---
+
+## RabbitMQ Management UI
+
+[http://localhost:15672](http://localhost:15672) — username `guest`, password `guest`
+
+Inspect queue depths, message rates, and dead-lettered jobs here.
+
+---
+
+## Roadmap
+
+- [ ] Web dashboard — real-time worker and job monitoring UI
+- [ ] Landing page
+- [ ] Prometheus metrics endpoint (`/metrics`)
+- [ ] Job status tracking — pending / running / complete / failed
+- [ ] Priority queues
+- [ ] Distributed registry (Redis) for multi-API-node deployments
+
+---
+
+## Author
+
+Built by **Philip Machar**
+
+---
+
+## License
+
+MIT
+</file>
+
 <file path="cmd/api/main.go">
+package main
+
+import (
+	"encoding/json"
+	"log"
+	"net"
+	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
+
+	"github.com/google/uuid"
+	"google.golang.org/grpc"
+
+	"jobqueue/internal/config"
+	"jobqueue/internal/jobs"
+	"jobqueue/internal/queue"
+	"jobqueue/internal/worker"
+	"jobqueue/proto/workerpb"
+)
+
+func main() {
+	cfg := config.Load()
+
+	// -------------------------------------------------------------------------
+	// Connect to RabbitMQ
+	// -------------------------------------------------------------------------
+	rmq, err := queue.NewRabbitMQ(&queue.Config{
+		URL:       cfg.RabbitMQURL,
+		QueueName: cfg.RabbitMQQueue,
+	})
+	if err != nil {
+		log.Fatalf("failed to connect to RabbitMQ: %v", err)
+	}
+	defer rmq.Close()
+
+	// -------------------------------------------------------------------------
+	// Worker registry + cleanup ticker
+	// -------------------------------------------------------------------------
+	registry := worker.NewRegistry()
+
+	go func() {
+		ticker := time.NewTicker(5 * time.Second)
+		defer ticker.Stop()
+		for range ticker.C {
+			registry.CleanupExpired()
+		}
+	}()
+
+	// -------------------------------------------------------------------------
+	// gRPC server — workers Register and Heartbeat here
+	// -------------------------------------------------------------------------
+	grpcServer := grpc.NewServer()
+	workerpb.RegisterWorkerServiceServer(grpcServer, worker.NewGRPCServer(registry))
+
+	grpcLis, err := net.Listen("tcp", cfg.GRPCAddr())
+	if err != nil {
+		log.Fatalf("failed to listen on gRPC port: %v", err)
+	}
+
+	go func() {
+		log.Printf("gRPC server listening on %s", cfg.GRPCAddr())
+		if err := grpcServer.Serve(grpcLis); err != nil {
+			log.Fatalf("gRPC server error: %v", err)
+		}
+	}()
+
+	// -------------------------------------------------------------------------
+	// HTTP API server
+	// -------------------------------------------------------------------------
+	mux := http.NewServeMux()
+
+	// POST /jobs — submit a job
+	mux.HandleFunc("/jobs", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		var body struct {
+			Type    string      `json:"type"`
+			Payload interface{} `json:"payload"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			http.Error(w, "invalid request: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+
+		job := jobs.Job{
+			ID:       uuid.NewString(),
+			Type:     body.Type,
+			Payload:  body.Payload,
+			Attempts: 0,
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusAccepted)
+
+		// Try direct dispatch to a live worker first.
+		workerID := registry.PickWorker()
+		if workerID != "" {
+			if err := registry.DispatchJob(workerID, job.ID, job.Type, job.Payload); err == nil {
+				log.Printf("job %s dispatched directly to worker %s", job.ID, workerID)
+				json.NewEncoder(w).Encode(map[string]interface{}{
+					"job":       job,
+					"routed":    "direct",
+					"worker_id": workerID,
+				})
+				return
+			}
+			log.Printf("direct dispatch to worker %s failed, falling back to queue", workerID)
+		}
+
+		// No alive workers or dispatch failed — publish to RabbitMQ.
+		data, err := json.Marshal(job)
+		if err != nil {
+			http.Error(w, "failed to encode job", http.StatusInternalServerError)
+			return
+		}
+		if err := rmq.Publish(data); err != nil {
+			http.Error(w, "failed to queue job", http.StatusInternalServerError)
+			return
+		}
+		log.Printf("job %s queued (no alive workers)", job.ID)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"job":    job,
+			"routed": "queue",
+			"note":   "no alive workers, job queued",
+		})
+	})
+
+	// GET /workers — live snapshot of the worker fleet
+	mux.HandleFunc("/workers", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		snapshot := registry.List()
+
+		type workerView struct {
+			WorkerID     string `json:"worker_id"`
+			LastSeenUnix int64  `json:"last_seen_unix"`
+			Load         int32  `json:"load"`
+			Status       string `json:"status"`
+		}
+
+		workers := make([]workerView, 0, len(snapshot))
+		for id, info := range snapshot {
+			status := "idle"
+			if info.Load > 0 {
+				status = "busy"
+			}
+			workers = append(workers, workerView{
+				WorkerID:     id,
+				LastSeenUnix: info.LastSeen.Unix(),
+				Load:         info.Load,
+				Status:       status,
+			})
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"count":   len(workers),
+			"workers": workers,
+		})
+	})
+
+	httpServer := &http.Server{
+		Addr:    cfg.HTTPAddr(),
+		Handler: mux,
+	}
+
+	go func() {
+		log.Printf("API listening on %s", cfg.HTTPAddr())
+		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("HTTP server error: %v", err)
+		}
+	}()
+
+	// -------------------------------------------------------------------------
+	// Graceful shutdown
+	// -------------------------------------------------------------------------
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+	<-quit
+
+	log.Println("Shutting down API server...")
+	grpcServer.GracefulStop()
+	log.Println("API server stopped cleanly")
+}
+</file>
+
+<file path="cmd/worker/worker_main/main.go">
 package main
 
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -1855,6 +3053,9 @@ func main() {
 	cfg := config.Load()
 
 	workerID := uuid.NewString()
+	// Use cfg.WorkerDispatchAddress() so WORKER_HOST is respected in Docker
+	// (resolves to "worker:<port>") while still defaulting to "localhost:<port>"
+	// when running locally.
 	dispatchAddr := cfg.WorkerDispatchAddress()
 
 	// -------------------------------------------------------------------------
@@ -1919,7 +3120,8 @@ func main() {
 
 	apiClient := workerpb.NewWorkerServiceClient(conn)
 
-	registrationID := fmt.Sprintf("%s@%s", workerID, dispatchAddr)
+	// Register with format "uuid@host:port" so the API can store the dispatch address.
+	registrationID := workerID + "@" + dispatchAddr
 	_, err = apiClient.Register(
 		context.Background(),
 		&workerpb.RegisterRequest{WorkerId: registrationID},
@@ -2003,20 +3205,31 @@ func main() {
 	log.Println("Worker stopped cleanly")
 }
 
-func handleMessage(msg amqp.Delivery, rmq *queue.RabbitMQ) {
+func handleMessage(msg amqp.Delivery, rmq queue.Queue) {
 	var job jobs.Job
 
 	if err := json.Unmarshal(msg.Body, &job); err != nil {
 		log.Println("invalid job payload, discarded:", err)
+		// Malformed message — Nack without requeue so it routes to DLQ via DLX.
 		_ = msg.Nack(false, false)
 		return
 	}
 
 	log.Printf("[queue] job received: id=%s type=%s attempt=%d", job.ID, job.Type, job.Attempts)
 
-	if job.Attempts < maxAttempts-1 {
-		job.Attempts++
-		log.Printf("[queue] job %s retrying (%d/%d)", job.ID, job.Attempts, maxAttempts)
+	// Simulate job processing — replace this with real handler logic.
+	jobSucceeded := true // TODO: run the actual job here
+
+	if jobSucceeded {
+		log.Printf("[queue] job %s succeeded on attempt %d", job.ID, job.Attempts)
+		_ = msg.Ack(false)
+		return
+	}
+
+	// Job failed — decide whether to retry or send to DLQ.
+	job.Attempts++
+	if job.Attempts < maxAttempts {
+		log.Printf("[queue] job %s failed, retrying (%d/%d)", job.ID, job.Attempts, maxAttempts)
 
 		data, err := json.Marshal(job)
 		if err != nil {
@@ -2025,230 +3238,18 @@ func handleMessage(msg amqp.Delivery, rmq *queue.RabbitMQ) {
 			return
 		}
 
-		_ = msg.Nack(false, false)
-
+		// Ack the original message and re-publish with the incremented attempt
+		// counter so retries are tracked correctly.
+		_ = msg.Ack(false)
 		if err := rmq.Publish(data); err != nil {
-			log.Println("failed to re-publish job:", err)
+			log.Printf("failed to re-publish job %s: %v", job.ID, err)
 		}
 		return
 	}
 
-	log.Printf("[queue] job %s succeeded", job.ID)
-	_ = msg.Ack(false)
-}
-</file>
-
-<file path="cmd/worker/worker_main/main.go">
-package main
-
-import (
-	"context"
-	"encoding/json"
-	"fmt"
-	"log"
-	"net/http"
-	"os"
-	"os/signal"
-	"syscall"
-	"time"
-
-	"github.com/google/uuid"
-	amqp "github.com/rabbitmq/amqp091-go"
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
-
-	"jobqueue/internal/config"
-	"jobqueue/internal/jobs"
-	"jobqueue/internal/queue"
-	"jobqueue/proto/workerpb"
-)
-
-const maxAttempts = 3
-
-func main() {
-	cfg := config.Load()
-
-	workerID := uuid.NewString()
-	dispatchAddr := fmt.Sprintf("localhost:%s", cfg.WorkerDispatchPort)
-
-	// -------------------------------------------------------------------------
-	// Connect to RabbitMQ
-	// -------------------------------------------------------------------------
-	rmq, err := queue.NewRabbitMQ(&queue.Config{
-		URL:       cfg.RabbitMQURL,
-		QueueName: cfg.RabbitMQQueue,
-	})
-	if err != nil {
-		log.Fatalf("failed to connect to RabbitMQ: %v", err)
-	}
-
-	// -------------------------------------------------------------------------
-	// HTTP dispatch server
-	// -------------------------------------------------------------------------
-	mux := http.NewServeMux()
-	mux.HandleFunc("/dispatch", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-
-		var req struct {
-			JobID   string      `json:"job_id"`
-			JobType string      `json:"job_type"`
-			Payload interface{} `json:"payload"`
-		}
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			http.Error(w, "invalid request: "+err.Error(), http.StatusBadRequest)
-			return
-		}
-
-		log.Printf("[direct] job received: id=%s type=%s", req.JobID, req.JobType)
-		log.Printf("[direct] job %s completed", req.JobID)
-
-		w.WriteHeader(http.StatusOK)
-	})
-
-	httpServer := &http.Server{
-		Addr:    cfg.DispatchAddr(),
-		Handler: mux,
-	}
-
-	go func() {
-		log.Printf("HTTP dispatch server listening on %s", cfg.DispatchAddr())
-		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("dispatch server error: %v", err)
-		}
-	}()
-
-	// -------------------------------------------------------------------------
-	// Connect to API gRPC and register
-	// -------------------------------------------------------------------------
-	conn, err := grpc.NewClient(
-		cfg.APIGRPCAddr,
-		grpc.WithTransportCredentials(insecure.NewCredentials()),
-	)
-	if err != nil {
-		log.Fatalf("failed to connect to API gRPC: %v", err)
-	}
-
-	apiClient := workerpb.NewWorkerServiceClient(conn)
-
-	registrationID := fmt.Sprintf("%s@%s", workerID, dispatchAddr)
-	_, err = apiClient.Register(
-		context.Background(),
-		&workerpb.RegisterRequest{WorkerId: registrationID},
-	)
-	if err != nil {
-		log.Fatalf("failed to register: %v", err)
-	}
-	log.Printf("Worker registered | id=%s | dispatch=http://%s", workerID, dispatchAddr)
-
-	// -------------------------------------------------------------------------
-	// Heartbeat loop
-	// -------------------------------------------------------------------------
-	var currentLoad int32 = 0
-
-	go func() {
-		ticker := time.NewTicker(5 * time.Second)
-		defer ticker.Stop()
-
-		for range ticker.C {
-			_, err := apiClient.Heartbeat(
-				context.Background(),
-				&workerpb.HeartbeatRequest{
-					WorkerId: workerID,
-					Load:     currentLoad,
-				},
-			)
-			if err != nil {
-				log.Println("heartbeat failed:", err)
-				continue
-			}
-			log.Printf("heartbeat sent (load=%d)", currentLoad)
-		}
-	}()
-
-	// -------------------------------------------------------------------------
-	// RabbitMQ consumer
-	// -------------------------------------------------------------------------
-	if err := rmq.Channel().Qos(1, 0, false); err != nil {
-		log.Fatalf("failed to set QoS: %v", err)
-	}
-
-	msgs, err := rmq.Channel().Consume(
-		cfg.RabbitMQQueue,
-		"",
-		false,
-		false,
-		false,
-		false,
-		nil,
-	)
-	if err != nil {
-		log.Fatalf("failed to start consuming: %v", err)
-	}
-
-	log.Println("Worker ready — waiting for jobs")
-
-	// -------------------------------------------------------------------------
-	// Graceful shutdown
-	// -------------------------------------------------------------------------
-	quit := make(chan os.Signal, 1)
-	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
-
-	go func() {
-		for msg := range msgs {
-			currentLoad = 1
-			handleMessage(msg, rmq)
-			currentLoad = 0
-		}
-	}()
-
-	<-quit
-	log.Println("Shutting down worker...")
-
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	httpServer.Shutdown(ctx)
-	rmq.Close()
-	conn.Close()
-
-	log.Println("Worker stopped cleanly")
-}
-
-func handleMessage(msg amqp.Delivery, rmq *queue.RabbitMQ) {
-	var job jobs.Job
-
-	if err := json.Unmarshal(msg.Body, &job); err != nil {
-		log.Println("invalid job payload, discarded:", err)
-		_ = msg.Nack(false, false)
-		return
-	}
-
-	log.Printf("[queue] job received: id=%s type=%s attempt=%d", job.ID, job.Type, job.Attempts)
-
-	if job.Attempts < maxAttempts-1 {
-		job.Attempts++
-		log.Printf("[queue] job %s retrying (%d/%d)", job.ID, job.Attempts, maxAttempts)
-
-		data, err := json.Marshal(job)
-		if err != nil {
-			log.Println("failed to re-marshal job, discarding:", err)
-			_ = msg.Nack(false, false)
-			return
-		}
-
-		_ = msg.Nack(false, false)
-
-		if err := rmq.Publish(data); err != nil {
-			log.Println("failed to re-publish job:", err)
-		}
-		return
-	}
-
-	log.Printf("[queue] job %s succeeded", job.ID)
-	_ = msg.Ack(false)
+	// Exhausted all attempts — Nack without requeue so the DLX routes it to DLQ.
+	log.Printf("[queue] job %s exhausted all %d attempts — sending to DLQ", job.ID, maxAttempts)
+	_ = msg.Nack(false, false)
 }
 </file>
 
