@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"jobqueue/internal/events"
 	"jobqueue/internal/worker"
 )
 
@@ -38,10 +39,11 @@ func (s *stubQueue) Close() error { return nil }
 func TestJobsHandler_WrongMethod(t *testing.T) {
 	reg := worker.NewRegistry()
 	q := &stubQueue{}
+	ring := events.NewRing(100)
 
 	req := httptest.NewRequest(http.MethodGet, "/jobs", nil)
 	rr := httptest.NewRecorder()
-	jobsHandler(reg, q)(rr, req)
+	jobsHandler(reg, q, ring)(rr, req)
 
 	if rr.Code != http.StatusMethodNotAllowed {
 		t.Errorf("expected 405, got %d", rr.Code)
@@ -55,11 +57,12 @@ func TestJobsHandler_WrongMethod(t *testing.T) {
 func TestJobsHandler_InvalidBody(t *testing.T) {
 	reg := worker.NewRegistry()
 	q := &stubQueue{}
+	ring := events.NewRing(100)
 
 	req := httptest.NewRequest(http.MethodPost, "/jobs", strings.NewReader("{bad json}"))
 	req.Header.Set("Content-Type", "application/json")
 	rr := httptest.NewRecorder()
-	jobsHandler(reg, q)(rr, req)
+	jobsHandler(reg, q, ring)(rr, req)
 
 	if rr.Code != http.StatusBadRequest {
 		t.Errorf("expected 400, got %d", rr.Code)
@@ -71,14 +74,15 @@ func TestJobsHandler_InvalidBody(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestJobsHandler_NoWorkers_RoutedToQueue(t *testing.T) {
-	reg := worker.NewRegistry() // empty registry
+	reg := worker.NewRegistry()
 	q := &stubQueue{}
+	ring := events.NewRing(100)
 
 	body := `{"type":"email","payload":{"to":"a@b.com"}}`
 	req := httptest.NewRequest(http.MethodPost, "/jobs", strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	rr := httptest.NewRecorder()
-	jobsHandler(reg, q)(rr, req)
+	jobsHandler(reg, q, ring)(rr, req)
 
 	if rr.Code != http.StatusAccepted {
 		t.Errorf("expected 202, got %d", rr.Code)
@@ -94,6 +98,15 @@ func TestJobsHandler_NoWorkers_RoutedToQueue(t *testing.T) {
 	if len(q.published) != 1 {
 		t.Errorf("expected 1 published message, got %d", len(q.published))
 	}
+
+	// Verify event was recorded.
+	snap := ring.Snapshot()
+	if len(snap) != 1 {
+		t.Errorf("expected 1 event in ring, got %d", len(snap))
+	}
+	if snap[0].Kind != events.KindQueued {
+		t.Errorf("expected event kind queued, got %v", snap[0].Kind)
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -101,23 +114,22 @@ func TestJobsHandler_NoWorkers_RoutedToQueue(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestJobsHandler_WithWorker_RoutedDirect(t *testing.T) {
-	// Spin up a fake worker dispatch server.
 	workerServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	}))
 	defer workerServer.Close()
 
 	reg := worker.NewRegistry()
-	// Strip scheme — registry prepends "http://" internally.
 	reg.Register("w1", workerServer.Listener.Addr().String())
 
 	q := &stubQueue{}
+	ring := events.NewRing(100)
 
 	body := `{"type":"email","payload":{"to":"a@b.com"}}`
 	req := httptest.NewRequest(http.MethodPost, "/jobs", strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	rr := httptest.NewRecorder()
-	jobsHandler(reg, q)(rr, req)
+	jobsHandler(reg, q, ring)(rr, req)
 
 	if rr.Code != http.StatusAccepted {
 		t.Errorf("expected 202, got %d", rr.Code)
@@ -133,9 +145,17 @@ func TestJobsHandler_WithWorker_RoutedDirect(t *testing.T) {
 	if resp["worker_id"] != "w1" {
 		t.Errorf("expected worker_id=w1, got %v", resp["worker_id"])
 	}
-	// Nothing should have been queued.
 	if len(q.published) != 0 {
 		t.Errorf("expected 0 published messages, got %d", len(q.published))
+	}
+
+	// Verify event was recorded.
+	snap := ring.Snapshot()
+	if len(snap) != 1 {
+		t.Errorf("expected 1 event in ring, got %d", len(snap))
+	}
+	if snap[0].Kind != events.KindDirect {
+		t.Errorf("expected event kind direct, got %v", snap[0].Kind)
 	}
 }
 
@@ -144,7 +164,6 @@ func TestJobsHandler_WithWorker_RoutedDirect(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestJobsHandler_WorkerDispatchFails_FallsBackToQueue(t *testing.T) {
-	// Fake worker that always returns 500.
 	workerServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
 	}))
@@ -154,12 +173,13 @@ func TestJobsHandler_WorkerDispatchFails_FallsBackToQueue(t *testing.T) {
 	reg.Register("w1", workerServer.Listener.Addr().String())
 
 	q := &stubQueue{}
+	ring := events.NewRing(100)
 
 	body := `{"type":"email","payload":{}}`
 	req := httptest.NewRequest(http.MethodPost, "/jobs", strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	rr := httptest.NewRecorder()
-	jobsHandler(reg, q)(rr, req)
+	jobsHandler(reg, q, ring)(rr, req)
 
 	if rr.Code != http.StatusAccepted {
 		t.Errorf("expected 202, got %d", rr.Code)
@@ -184,12 +204,13 @@ func TestJobsHandler_WorkerDispatchFails_FallsBackToQueue(t *testing.T) {
 func TestJobsHandler_ResponseContainsJobFields(t *testing.T) {
 	reg := worker.NewRegistry()
 	q := &stubQueue{}
+	ring := events.NewRing(100)
 
 	body := `{"type":"resize-image","payload":{"url":"https://example.com/img.png"}}`
 	req := httptest.NewRequest(http.MethodPost, "/jobs", strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	rr := httptest.NewRecorder()
-	jobsHandler(reg, q)(rr, req)
+	jobsHandler(reg, q, ring)(rr, req)
 
 	var resp map[string]interface{}
 	json.NewDecoder(rr.Body).Decode(&resp)
@@ -253,7 +274,7 @@ func TestWorkersHandler_ReturnsWorkersWithStatus(t *testing.T) {
 	reg := worker.NewRegistry()
 	reg.Register("w1", "localhost:9001")
 	reg.Register("w2", "localhost:9002")
-	reg.UpdateLoad("w2", 1) // mark w2 as busy
+	reg.UpdateLoad("w2", 1)
 
 	req := httptest.NewRequest(http.MethodGet, "/workers", nil)
 	rr := httptest.NewRecorder()
@@ -278,5 +299,37 @@ func TestWorkersHandler_ReturnsWorkersWithStatus(t *testing.T) {
 	}
 	if statusByID["w2"] != "busy" {
 		t.Errorf("expected w2 busy, got %s", statusByID["w2"])
+	}
+}
+
+// ---------------------------------------------------------------------------
+// GET /events — returns events in reverse chronological order
+// ---------------------------------------------------------------------------
+
+func TestEventsHandler_ReturnsEvents(t *testing.T) {
+	ring := events.NewRing(100)
+	ring.Push(events.Event{JobID: "j1", JobType: "email", Kind: events.KindQueued, Message: "queued"})
+	ring.Push(events.Event{JobID: "j2", JobType: "email", Kind: events.KindDirect, Message: "direct"})
+
+	req := httptest.NewRequest(http.MethodGet, "/events", nil)
+	rr := httptest.NewRecorder()
+	eventsHandler(ring)(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Errorf("expected 200, got %d", rr.Code)
+	}
+
+	var resp map[string]interface{}
+	json.NewDecoder(rr.Body).Decode(&resp)
+
+	if resp["count"].(float64) != 2 {
+		t.Errorf("expected count 2, got %v", resp["count"])
+	}
+
+	evts := resp["events"].([]interface{})
+	// Newest first — j2 should be index 0.
+	first := evts[0].(map[string]interface{})
+	if first["job_id"] != "j2" {
+		t.Errorf("expected newest event first (j2), got %v", first["job_id"])
 	}
 }

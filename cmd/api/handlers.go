@@ -7,13 +7,22 @@ import (
 
 	"github.com/google/uuid"
 
+	"jobqueue/internal/events"
 	"jobqueue/internal/jobs"
 	"jobqueue/internal/queue"
 	"jobqueue/internal/worker"
 )
 
+// shortID returns the first 8 characters of id, or id itself if shorter.
+func shortID(id string) string {
+	if len(id) <= 8 {
+		return id
+	}
+	return id[:8]
+}
+
 // jobsHandler handles POST /jobs.
-func jobsHandler(registry *worker.Registry, rmq queue.Queue) http.HandlerFunc {
+func jobsHandler(registry *worker.Registry, rmq queue.Queue, ring *events.Ring) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -43,6 +52,13 @@ func jobsHandler(registry *worker.Registry, rmq queue.Queue) http.HandlerFunc {
 		if workerID != "" {
 			if err := registry.DispatchJob(workerID, job.ID, job.Type, job.Payload); err == nil {
 				log.Printf("job %s dispatched directly to worker %s", job.ID, workerID)
+				ring.Push(events.Event{
+					JobID:    job.ID,
+					JobType:  job.Type,
+					Kind:     events.KindDirect,
+					WorkerID: workerID,
+					Message:  "dispatched direct → " + shortID(workerID),
+				})
 				json.NewEncoder(w).Encode(map[string]interface{}{
 					"job":       job,
 					"routed":    "direct",
@@ -51,6 +67,12 @@ func jobsHandler(registry *worker.Registry, rmq queue.Queue) http.HandlerFunc {
 				return
 			}
 			log.Printf("direct dispatch to worker %s failed, falling back to queue", workerID)
+			ring.Push(events.Event{
+				JobID:   job.ID,
+				JobType: job.Type,
+				Kind:    events.KindError,
+				Message: "direct dispatch failed, falling back to queue",
+			})
 		}
 
 		data, err := json.Marshal(job)
@@ -63,6 +85,12 @@ func jobsHandler(registry *worker.Registry, rmq queue.Queue) http.HandlerFunc {
 			return
 		}
 		log.Printf("job %s queued (no alive workers)", job.ID)
+		ring.Push(events.Event{
+			JobID:   job.ID,
+			JobType: job.Type,
+			Kind:    events.KindQueued,
+			Message: "published to queue — no alive workers",
+		})
 		json.NewEncoder(w).Encode(map[string]interface{}{
 			"job":    job,
 			"routed": "queue",
@@ -106,6 +134,31 @@ func workersHandler(registry *worker.Registry) http.HandlerFunc {
 		json.NewEncoder(w).Encode(map[string]interface{}{
 			"count":   len(workers),
 			"workers": workers,
+		})
+	}
+}
+
+// eventsHandler handles GET /events — returns the recent activity ring as JSON.
+func eventsHandler(ring *events.Ring) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+
+		snapshot := ring.Snapshot()
+
+		// Return newest-first so the dashboard can prepend without reversing.
+		reversed := make([]events.Event, len(snapshot))
+		for i, e := range snapshot {
+			reversed[len(snapshot)-1-i] = e
+		}
+
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"count":  len(reversed),
+			"events": reversed,
 		})
 	}
 }

@@ -14,6 +14,7 @@ import (
 	"google.golang.org/grpc"
 
 	"jobqueue/internal/config"
+	"jobqueue/internal/events"
 	"jobqueue/internal/queue"
 	"jobqueue/internal/worker"
 	"jobqueue/proto/workerpb"
@@ -25,6 +26,9 @@ var staticFiles embed.FS
 func main() {
 	cfg := config.Load()
 
+	// -------------------------------------------------------------------------
+	// Connect to RabbitMQ
+	// -------------------------------------------------------------------------
 	rmq, err := queue.NewRabbitMQ(&queue.Config{
 		URL:       cfg.RabbitMQURL,
 		QueueName: cfg.RabbitMQQueue,
@@ -34,6 +38,9 @@ func main() {
 	}
 	defer rmq.Close()
 
+	// -------------------------------------------------------------------------
+	// Worker registry + cleanup ticker
+	// -------------------------------------------------------------------------
 	registry := worker.NewRegistry()
 
 	go func() {
@@ -44,6 +51,14 @@ func main() {
 		}
 	}()
 
+	// -------------------------------------------------------------------------
+	// Event ring — last 100 job events for the dashboard
+	// -------------------------------------------------------------------------
+	ring := events.NewRing(100)
+
+	// -------------------------------------------------------------------------
+	// gRPC server — workers Register and Heartbeat here
+	// -------------------------------------------------------------------------
 	grpcServer := grpc.NewServer()
 	workerpb.RegisterWorkerServiceServer(grpcServer, worker.NewGRPCServer(registry))
 
@@ -59,16 +74,27 @@ func main() {
 		}
 	}()
 
+	// -------------------------------------------------------------------------
+	// HTTP API server
+	// -------------------------------------------------------------------------
 	mux := http.NewServeMux()
-	mux.HandleFunc("/jobs", jobsHandler(registry, rmq))
+	mux.HandleFunc("/jobs", jobsHandler(registry, rmq, ring))
 	mux.HandleFunc("/workers", workersHandler(registry))
+	mux.HandleFunc("/events", eventsHandler(ring))
 
-	// Serve the dashboard at GET /
+	// Serve the dashboard — must be registered last so /jobs and /workers
+	// are never intercepted by the file server.
 	staticFS, err := fs.Sub(staticFiles, "static")
 	if err != nil {
 		log.Fatalf("failed to create static sub-filesystem: %v", err)
 	}
-	mux.Handle("/", http.FileServer(http.FS(staticFS)))
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/" {
+			http.NotFound(w, r)
+			return
+		}
+		http.ServeFileFS(w, r, staticFS, "index.html")
+	})
 
 	httpServer := &http.Server{
 		Addr:    cfg.HTTPAddr(),
@@ -82,6 +108,9 @@ func main() {
 		}
 	}()
 
+	// -------------------------------------------------------------------------
+	// Graceful shutdown
+	// -------------------------------------------------------------------------
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	<-quit
