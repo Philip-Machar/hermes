@@ -6,7 +6,7 @@ A production-grade distributed job processing system built in Go — featuring a
 [![RabbitMQ](https://img.shields.io/badge/RabbitMQ-3.13-FF6600?style=flat&logo=rabbitmq)](https://www.rabbitmq.com/)
 [![gRPC](https://img.shields.io/badge/gRPC-1.78-244c5a?style=flat&logo=grpc)](https://grpc.io/)
 [![Docker](https://img.shields.io/badge/Docker-Compose-2496ED?style=flat&logo=docker)](https://docs.docker.com/compose/)
-[![CI](https://github.com/yourname/hermes/actions/workflows/ci.yml/badge.svg)](https://github.com/yourname/hermes/actions/workflows/ci.yml)
+[![CI](https://github.com/akolmayek/hermes/actions/workflows/ci.yml/badge.svg)](https://github.com/akolmayek/hermes/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 ---
