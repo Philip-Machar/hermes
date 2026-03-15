@@ -1,11 +1,12 @@
 # Hermes
 
-A production-grade distributed job processing system built in Go — featuring a gRPC control plane, intelligent load-balanced HTTP dispatch, RabbitMQ-backed durability, graceful shutdown, and a fully containerised deployment.
+A production-grade distributed job processing system built in Go — featuring a gRPC control plane, intelligent load-balanced HTTP dispatch, RabbitMQ-backed durability, graceful shutdown, a real-time web dashboard, and a fully containerised deployment.
 
 [![Go Version](https://img.shields.io/badge/Go-1.24+-00ADD8?style=flat&logo=go)](https://golang.org/)
 [![RabbitMQ](https://img.shields.io/badge/RabbitMQ-3.13-FF6600?style=flat&logo=rabbitmq)](https://www.rabbitmq.com/)
 [![gRPC](https://img.shields.io/badge/gRPC-1.78-244c5a?style=flat&logo=grpc)](https://grpc.io/)
 [![Docker](https://img.shields.io/badge/Docker-Compose-2496ED?style=flat&logo=docker)](https://docs.docker.com/compose/)
+[![CI](https://github.com/yourname/hermes/actions/workflows/ci.yml/badge.svg)](https://github.com/yourname/hermes/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 ---
@@ -19,7 +20,9 @@ Hermes is built around a **control plane / data plane separation** — the same 
 - No external coordination service. The registry is in-memory with TTL-based expiry, kept consistent by the heartbeat protocol.
 - Jobs are never dropped. If direct dispatch fails, they fall back to RabbitMQ automatically — no retry logic needed at the client.
 - Workers report real load metrics. The router picks the least-loaded worker, not just any alive one.
+- Real job handlers are registered at startup. Adding a new job type is a single `Register` call — no switch statements, no conditionals.
 - The system shuts down cleanly. Both API and workers drain in-flight work before exiting.
+- A real-time dashboard surfaces worker fleet status and job activity live at `GET /`.
 
 ---
 
@@ -27,13 +30,7 @@ Hermes is built around a **control plane / data plane separation** — the same 
 
 > _Real-time worker and job monitoring dashboard_
 
-<!-- Add after dashboard is built -->
 ![Dashboard](docs/screenshots/dashboard.png)
-
-> _Landing page_
-
-<!-- Add after landing page is built -->
-![Landing](docs/screenshots/landing.png)
 
 ---
 
@@ -42,14 +39,15 @@ Hermes is built around a **control plane / data plane separation** — the same 
 ```
 ┌──────────────────────────────────────────────────────────────┐
 │                          CLIENT                              │
-│               curl / HTTP / Any HTTP client                  │
+│        curl / HTTP / Dashboard / Any HTTP client             │
 └────────────────────────────┬─────────────────────────────────┘
                              │  HTTP
                              ▼
 ┌──────────────────────────────────────────────────────────────┐
 │                     API SERVER  :8081                        │
 │                                                              │
-│   POST /jobs  ──►  Registry.PickWorker()                     │
+│   GET  /           ──►  Dashboard (embedded static UI)       │
+│   POST /jobs       ──►  Registry.PickWorker()                │
 │                          │                                   │
 │                   least-loaded worker?                       │
 │                   ┌──────┴──────┐                            │
@@ -60,6 +58,7 @@ Hermes is built around a **control plane / data plane separation** — the same 
 │           (fast path)       (reliable fallback)              │
 │                                                              │
 │   GET /workers  ──►  Registry.List() snapshot                │
+│   GET /events   ──►  Event ring (last 100 job events)        │
 │                                                              │
 │   gRPC :50051  ◄──  Workers (Register / Heartbeat)           │
 └────────┬─────────────────────────┬───────────────────────────┘
@@ -93,7 +92,7 @@ When a job arrives the API scores every alive worker by current load and POSTs t
 
 ### Reliability layer — RabbitMQ
 
-Every worker also consumes from the same RabbitMQ queue. Jobs that cannot be dispatched directly, or that fail during processing, are retried up to 3 times with exponential nack. After 3 failed attempts they are moved to a Dead Letter Queue for inspection — nothing is silently dropped.
+Every worker also consumes from the same RabbitMQ queue. Jobs that cannot be dispatched directly, or that fail during processing, are retried up to 3 times. After 3 failed attempts they are moved to a Dead Letter Queue for inspection — nothing is silently dropped.
 
 ---
 
@@ -108,6 +107,9 @@ For a single-node deployment, an in-memory registry with TTL-based expiry is sim
 **Why least-loaded routing instead of round-robin?**
 Workers report a live load counter with every heartbeat. Routing to the least-loaded worker is a 5-line change that meaningfully reduces tail latency under uneven workloads — and is a more accurate reflection of real capacity than a simple counter.
 
+**Why a handler registry instead of a switch statement?**
+Each job type is a registered `Handler` implementation. The worker looks up the handler by `job.Type` at runtime — adding a new job type means writing a struct and one `Register` call at startup, with no changes to the dispatch or retry logic.
+
 ---
 
 ## Features
@@ -119,13 +121,17 @@ Workers report a live load counter with every heartbeat. Routing to the least-lo
 | Automatic failover | Falls back to RabbitMQ transparently when no workers are alive or dispatch fails |
 | Worker registry | In-memory registry with TTL-based eviction (15 s) |
 | Heartbeat monitoring | Workers report load and status every 5 seconds |
+| Job handler registry | Extensible handler pattern — add new job types with a single Register call |
 | Retry logic | Failed queue jobs retry up to 3 times before DLQ |
 | Dead Letter Queue | Failed jobs are captured for inspection, never silently dropped |
 | Graceful shutdown | API and workers drain in-flight work on SIGINT / SIGTERM before exiting |
+| Real-time dashboard | Live worker fleet and job activity log served at `GET /` |
+| Event ring | Server-side ring buffer records the last 100 job events, surfaced via `GET /events` |
 | Environment-driven config | No hardcoded credentials — everything configurable via environment variables |
 | Single-command deployment | `docker-compose up --build` starts RabbitMQ, API, and worker with health-checked ordering |
 | Multi-worker | Scale horizontally by starting additional worker instances — each self-registers |
-| Visibility API | `GET /workers` returns a live JSON snapshot of the fleet with load and status |
+| Integration tests | testcontainers-go spins up a real RabbitMQ container to test the full job flow end to end |
+| CI pipeline | GitHub Actions runs unit and integration tests on every push and pull request |
 
 ---
 
@@ -138,7 +144,10 @@ Workers report a live load counter with every heartbeat. Routing to the least-lo
 | Message broker | RabbitMQ 3.13 (AMQP 0.9.1) |
 | Job dispatch | HTTP/JSON |
 | Worker coordination | In-memory registry with TTL |
+| Dashboard | Embedded single-page HTML (Go embed.FS) |
 | Infrastructure | Docker Compose (multi-stage builds) |
+| Testing | testcontainers-go, Go testing package |
+| CI | GitHub Actions |
 
 ---
 
@@ -146,26 +155,40 @@ Workers report a live load counter with every heartbeat. Routing to the least-lo
 
 ```
 hermes/
+├── .github/
+│   └── workflows/
+│       └── ci.yml                # CI — unit + integration tests on every push
 ├── cmd/
 │   ├── api/
-│   │   └── main.go               # API server — HTTP :8081 + gRPC :50051
+│   │   ├── main.go               # API server — HTTP :8081 + gRPC :50051
+│   │   ├── handlers.go           # HTTP handlers — /jobs, /workers, /events
+│   │   └── static/
+│   │       └── index.html        # Real-time dashboard (embedded into binary)
 │   └── worker/
 │       ├── worker_main/
-│       │   └── main.go           # Worker node — dispatch server + consumer
+│       │   └── main.go           # Worker node — dispatch server + queue consumer
 │       └── dlq_consumer/
 │           └── main.go           # Dead-letter queue inspector
 ├── internal/
 │   ├── config/
 │   │   └── config.go             # Environment-driven configuration
+│   ├── events/
+│   │   └── ring.go               # Thread-safe ring buffer for job events
 │   ├── jobs/
-│   │   └── job.go                # Job struct
+│   │   ├── job.go                # Job struct
+│   │   ├── handler.go            # Handler interface + HandlerRegistry
+│   │   └── handlers/
+│   │       ├── email.go          # Email job handler
+│   │       └── resize_image.go   # Resize-image job handler
 │   ├── queue/
 │   │   ├── config.go             # RabbitMQ topology config
 │   │   ├── queue.go              # Queue interface
-│   │   └── rabbitmq.go           # RabbitMQ implementation, DLQ setup, retry loop
+│   │   └── rabbitmq.go           # RabbitMQ implementation, DLQ setup
 │   └── worker/
 │       ├── registry.go           # In-memory registry with least-loaded routing
 │       └── grpc_server.go        # gRPC handler — Register, Heartbeat, ListWorkers
+├── internal/integration/
+│   └── queue_test.go             # End-to-end integration tests (testcontainers-go)
 ├── proto/
 │   ├── worker.proto              # Protobuf service definition
 │   └── workerpb/
@@ -195,6 +218,8 @@ docker-compose up --build
 
 RabbitMQ starts first with a health check. The API waits for RabbitMQ to be ready. The worker waits for both. Everything comes up in the right order automatically.
 
+Then open **http://localhost:8081** to view the live dashboard.
+
 ### Option B — Local development
 
 **Prerequisites:** Go 1.24+, Docker (for RabbitMQ)
@@ -204,18 +229,22 @@ RabbitMQ starts first with a health check. The API waits for RabbitMQ to be read
 docker-compose up -d rabbitmq
 
 # 2. Start the API
-go run ./cmd/api/main.go
+go run ./cmd/api
 
 # 3. Start a worker (separate terminal)
 go run ./cmd/worker/worker_main/main.go
 
-# 4. Optionally start a second worker
-WORKER_DISPATCH_PORT=9002 go run ./cmd/worker/worker_main/main.go
+# 4. Scale horizontally — each worker self-registers on its own port
+API_GRPC_ADDR=localhost:50051 WORKER_DISPATCH_PORT=9002 go run ./cmd/worker/worker_main/main.go
+API_GRPC_ADDR=localhost:50051 WORKER_DISPATCH_PORT=9003 go run ./cmd/worker/worker_main/main.go
 ```
 
 ### Test it
 
 ```bash
+# Open the dashboard
+open http://localhost:8081
+
 # Check the worker fleet
 curl http://localhost:8081/workers
 
@@ -223,6 +252,13 @@ curl http://localhost:8081/workers
 curl -X POST http://localhost:8081/jobs \
   -H "Content-Type: application/json" \
   -d '{"type":"email","payload":{"to":"user@example.com","subject":"Hello"}}'
+
+# Flood the system with 10 concurrent jobs
+for i in {1..10}; do
+  curl -s -X POST http://localhost:8081/jobs \
+    -H "Content-Type: application/json" \
+    -d "{\"type\":\"email\",\"payload\":{\"to\":\"user$i@example.com\",\"subject\":\"Test $i\"}}" &
+done
 ```
 
 **Direct dispatch response (worker alive):**
@@ -252,6 +288,12 @@ curl -X POST http://localhost:8081/jobs \
 
 ## API Reference
 
+### `GET /`
+
+Serves the real-time dashboard — live worker fleet status, load metrics, and a scrolling activity log of all job events. Also provides a job submission modal.
+
+---
+
 ### `POST /jobs`
 
 Submit a job for processing.
@@ -274,6 +316,8 @@ Submit a job for processing.
 ```
 
 `routed` is either `"direct"` (dispatched to a live worker) or `"queue"` (published to RabbitMQ).
+
+**Supported job types:** `email`, `resize-image`
 
 ---
 
@@ -301,6 +345,80 @@ Live snapshot of the worker fleet.
   ]
 }
 ```
+
+---
+
+### `GET /events`
+
+The last 100 job events recorded by the API, newest first. Used by the dashboard to populate the activity log.
+
+**Response:**
+```json
+{
+  "count": 3,
+  "events": [
+    {
+      "time": "2025-01-01T12:00:02Z",
+      "job_id": "1d3de6cf-...",
+      "job_type": "email",
+      "kind": "direct",
+      "worker_id": "8a4605e1-...",
+      "message": "dispatched direct → 8a4605e1"
+    },
+    {
+      "time": "2025-01-01T12:00:01Z",
+      "job_id": "2e4df7ag-...",
+      "job_type": "resize-image",
+      "kind": "queued",
+      "message": "published to queue — no alive workers"
+    }
+  ]
+}
+```
+
+`kind` is one of `direct`, `queued`, or `error`.
+
+---
+
+## Adding a New Job Type
+
+1. Create `internal/jobs/handlers/your_type.go` implementing the `jobs.Handler` interface:
+
+```go
+type YourHandler struct{}
+
+func (h *YourHandler) Handle(ctx context.Context, job jobs.Job) error {
+    // your logic here
+    return nil
+}
+```
+
+2. Register it in `cmd/worker/worker_main/main.go`:
+
+```go
+func init() {
+    handlerRegistry = jobs.NewHandlerRegistry()
+    handlerRegistry.Register("email", &handlers.EmailHandler{})
+    handlerRegistry.Register("resize-image", &handlers.ResizeImageHandler{})
+    handlerRegistry.Register("your-type", &handlers.YourHandler{})  // add this
+}
+```
+
+That's it. No changes to routing, retry, or DLQ logic.
+
+---
+
+## Testing
+
+```bash
+# Unit tests
+go test ./...
+
+# Integration tests (requires Docker)
+go test -tags integration -timeout=120s ./internal/integration/...
+```
+
+Integration tests use testcontainers-go to spin up a real RabbitMQ container and verify the full `POST /jobs → queue → consumer → ack` flow end to end, including the retry loop and DLQ path.
 
 ---
 
@@ -337,14 +455,17 @@ Registry.PickWorker()  ←  scores all alive workers by current load
     │   HTTP POST → worker /dispatch
     │       │
     │       ├── 200 OK  →  202 { routed: "direct", worker_id: "..." }
+    │       │               event kind: "direct" pushed to ring
     │       │
     │       └── error   →  publish to RabbitMQ
     │                          │
-    │                      202 { routed: "queue", note: "worker unreachable" }
+    │                      202 { routed: "queue" }
+    │                          event kind: "error" pushed to ring
     │
     └── no workers alive  →  publish to RabbitMQ
                                    │
-                               202 { routed: "queue", note: "no alive workers" }
+                               202 { routed: "queue" }
+                                   event kind: "queued" pushed to ring
 ```
 
 ---
@@ -354,7 +475,7 @@ Registry.PickWorker()  ←  scores all alive workers by current load
 ```
 startup
    │
-   ├─ connect to RabbitMQ (retry loop, up to 10 attempts)
+   ├─ connect to RabbitMQ (retry loop, up to 20 attempts)
    ├─ start HTTP /dispatch server
    ├─ dial API gRPC :50051
    ├─ Register("<uuid>@<host>:<port>")
@@ -364,17 +485,22 @@ startup
    │                                                           │
    ├─ RabbitMQ consumer goroutine                              │
    │       │                                                   │
-   │       ├─ message received → process → Ack                 │
-   │       │                                                   │
-   │       └─ failure → increment attempts                     │
-   │               │                                           │
-   │               ├─ attempts < 3 → Nack (re-queued)          │
-   │               │                                           │
-   │               └─ attempts == 3 → Dead Letter Queue        │
+   │       ├─ message received                                 │
+   │       │       │                                           │
+   │       │       ▼                                           │
+   │       │   HandlerRegistry.Dispatch(ctx, job)              │
+   │       │       │                                           │
+   │       │       ├─ success → Ack                            │
+   │       │       │                                           │
+   │       │       └─ failure → increment attempts             │
+   │       │               │                                   │
+   │       │               ├─ attempts < 3 → re-publish        │
+   │       │               │                                   │
+   │       │               └─ attempts == 3 → Nack → DLQ       │
    │                                                           │
    └─ SIGINT / SIGTERM received                                │
            │                                                   │
-           ├─ HTTP server: graceful shutdown (5 s timeout)  ◄──┘
+           ├─ HTTP server: graceful shutdown (10 s timeout) ◄──┘
            ├─ RabbitMQ connection: close
            └─ gRPC connection: close
 ```
@@ -385,8 +511,8 @@ startup
 
 Both the API and worker handle `SIGINT` and `SIGTERM`. On receiving a signal:
 
-- The **API** stops accepting new HTTP requests, waits up to 5 seconds for in-flight handlers to complete, then stops the gRPC server and closes the RabbitMQ connection.
-- Each **worker** shuts down its dispatch HTTP server, closes its RabbitMQ consumer, and closes its gRPC connection to the API.
+- The **API** stops accepting new HTTP requests, stops the gRPC server, and closes the RabbitMQ connection.
+- Each **worker** shuts down its dispatch HTTP server with a 10-second timeout, closes its RabbitMQ consumer, and closes its gRPC connection to the API.
 
 A rolling deployment or `docker-compose down` will not drop in-flight jobs.
 
@@ -404,7 +530,7 @@ go run ./cmd/worker/dlq_consumer/main.go
 
 ## RabbitMQ Management UI
 
-[http://localhost:15672](http://localhost:15672) — username `guest`, password `guest`
+[http://localhost:15672](http://localhost:15672) — username and password set in `.env`
 
 Inspect queue depths, message rates, and dead-lettered jobs here.
 
@@ -412,7 +538,9 @@ Inspect queue depths, message rates, and dead-lettered jobs here.
 
 ## Roadmap
 
-- [ ] Web dashboard — real-time worker and job monitoring UI
+- [x] Web dashboard — real-time worker and job monitoring UI
+- [x] Integration tests — testcontainers-go end-to-end test suite
+- [x] CI pipeline — GitHub Actions on every push and pull request
 - [ ] Landing page
 - [ ] Prometheus metrics endpoint (`/metrics`)
 - [ ] Job status tracking — pending / running / complete / failed
