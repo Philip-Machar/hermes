@@ -3,524 +3,788 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Hermes — System Dashboard</title>
+  <title>Hermes — Job Queue Monitor</title>
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-  <link href="https://fonts.googleapis.com/css2?family=Departure+Mono&family=Cormorant:ital,wght@0,300;0,400;0,600;1,300;1,400&display=swap" rel="stylesheet" />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
 
   <style>
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
     :root {
-      --bg:         #0e0e0b;
-      --bg-raised:  #131310;
-      --bg-line:    #1a1a17;
-      --border:     #272722;
-      --border-mid: #3a3a33;
-      --text-dim:   #44443c;
-      --text-mid:   #78786e;
-      --text:       #c8c8b8;
-      --text-bright:#eeeee0;
-      --amber:      #d4891a;
-      --amber-dim:  #6e450a;
-      --amber-glow: rgba(212,137,26,0.10);
-      --green:      #4a8c5c;
-      --red-bright: #c45050;
-      --mono:       'Departure Mono', monospace;
-      --serif:      'Cormorant', serif;
+      --black:     #090909;
+      --card:      #111111;
+      --card-2:    #171717;
+      --card-3:    #1e1e1e;
+      --border:    #232323;
+      --border-2:  #2e2e2e;
+      --white:     #ffffff;
+      --text:      #e4e4e4;
+      --text-2:    #a0a0a0;
+      --text-3:    #666666;
+      --green:     #00c853;
+      --green-bg:  rgba(0,200,83,0.08);
+      --amber:     #ffab00;
+      --amber-bg:  rgba(255,171,0,0.08);
+      --red:       #ff4444;
+      --red-bg:    rgba(255,68,68,0.08);
+      --blue:      #4488ff;
+      --mono:      'JetBrains Mono', monospace;
+      --sans:      'Inter', sans-serif;
     }
 
-    html { font-size: 14px; }
+    html { font-size: 15px; }
 
     body {
-      background: var(--bg);
+      background: var(--black);
       color: var(--text);
-      font-family: var(--mono);
+      font-family: var(--sans);
       min-height: 100vh;
-      overflow-x: hidden;
+      -webkit-font-smoothing: antialiased;
     }
 
-    /* Scan-line texture */
-    body::before {
-      content: '';
-      position: fixed;
-      inset: 0;
-      background: repeating-linear-gradient(
-        0deg,
-        transparent,
-        transparent 2px,
-        rgba(0,0,0,0.03) 2px,
-        rgba(0,0,0,0.03) 4px
-      );
-      pointer-events: none;
-      z-index: 1000;
-    }
-
-    /* ── Layout ── */
-    .shell {
-      max-width: 1400px;
-      margin: 0 auto;
+    /* ── Top nav ───────────────────────────────────────────────────────────── */
+    .topbar {
+      background: var(--card);
+      border-bottom: 1px solid var(--border);
       padding: 0 2rem;
       display: flex;
-      flex-direction: column;
-      min-height: 100vh;
-    }
-
-    /* ── Header ── */
-    header {
-      display: grid;
-      grid-template-columns: 1fr auto 1fr;
-      align-items: end;
-      padding: 2.5rem 0 1.5rem;
-      border-bottom: 1px solid var(--border);
-      gap: 2rem;
-    }
-
-    .header-left { display: flex; flex-direction: column; gap: 0.25rem; }
-
-    .wordmark {
-      font-family: var(--serif);
-      font-size: 2.4rem;
-      font-weight: 300;
-      letter-spacing: 0.12em;
-      color: var(--text-bright);
-      line-height: 1;
-    }
-    .wordmark em { font-style: italic; color: var(--amber); }
-
-    .system-label {
-      font-size: 0.72rem;
-      letter-spacing: 0.25em;
-      text-transform: uppercase;
-      color: var(--text-dim);
-    }
-
-    .header-center {
-      display: flex;
-      flex-direction: column;
       align-items: center;
-      gap: 0.4rem;
+      justify-content: space-between;
+      height: 56px;
+      position: sticky;
+      top: 0;
+      z-index: 100;
     }
 
-    .status-pill {
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 0.65rem;
+    }
+
+    .brand-icon {
+      width: 30px;
+      height: 30px;
+      background: var(--green);
+      border-radius: 6px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-family: var(--mono);
+      font-weight: 600;
+      font-size: 0.75rem;
+      color: #000;
+    }
+
+    .brand-name {
+      font-size: 1rem;
+      font-weight: 700;
+      color: var(--white);
+      letter-spacing: -0.02em;
+    }
+
+    .nav-tabs {
+      display: flex;
+      align-items: center;
+      gap: 0;
+      height: 100%;
+    }
+
+    .nav-tab {
+      height: 100%;
+      display: flex;
+      align-items: center;
+      padding: 0 1.1rem;
+      font-size: 0.85rem;
+      font-weight: 500;
+      color: var(--text-3);
+      cursor: pointer;
+      border-bottom: 2px solid transparent;
+      transition: color 0.15s;
+      user-select: none;
+    }
+
+    .nav-tab.active {
+      color: var(--white);
+      border-bottom-color: var(--green);
+    }
+
+    .nav-tab:hover:not(.active) { color: var(--text-2); }
+
+    .nav-right {
+      display: flex;
+      align-items: center;
+      gap: 0.75rem;
+    }
+
+    .sys-status {
       display: flex;
       align-items: center;
       gap: 0.5rem;
-      font-size: 0.62rem;
-      letter-spacing: 0.2em;
-      text-transform: uppercase;
-      color: var(--text-mid);
-      border: 1px solid var(--border);
-      padding: 0.35rem 0.85rem;
+      font-size: 0.82rem;
+      color: var(--text-2);
+      font-weight: 500;
     }
 
-    .pulse-dot {
-      width: 6px; height: 6px;
+    .sys-dot {
+      width: 8px;
+      height: 8px;
       border-radius: 50%;
       background: var(--green);
-      animation: pulse 2.4s ease-in-out infinite;
       flex-shrink: 0;
     }
-    @keyframes pulse {
-      0%,100% { opacity:1; transform:scale(1); }
-      50%      { opacity:0.35; transform:scale(0.65); }
-    }
 
-    .clock { font-size: 0.65rem; color: var(--text-dim); letter-spacing: 0.08em; }
+    .sys-dot.warn { background: var(--amber); }
 
-    .header-right {
-      display: flex;
-      align-items: flex-end;
-      justify-content: flex-end;
-    }
-
-    .submit-btn {
-      background: none;
-      border: 1px solid var(--amber-dim);
-      color: var(--amber);
-      font-family: var(--mono);
-      font-size: 0.62rem;
-      letter-spacing: 0.2em;
-      text-transform: uppercase;
-      padding: 0.5rem 1.25rem;
+    .btn-submit {
+      background: var(--green);
+      color: #000;
+      border: none;
+      border-radius: 6px;
+      font-family: var(--sans);
+      font-weight: 600;
+      font-size: 0.82rem;
+      padding: 0.5rem 1rem;
       cursor: pointer;
-      transition: background 0.2s, border-color 0.2s;
+      transition: opacity 0.15s;
     }
-    .submit-btn:hover { background: var(--amber-glow); border-color: var(--amber); }
+    .btn-submit:hover { opacity: 0.85; }
 
-    /* ── Stat strip ── */
-    .stat-strip {
+    /* ── Page layout ───────────────────────────────────────────────────────── */
+    .page {
+      max-width: 1440px;
+      margin: 0 auto;
+      padding: 1.75rem 2rem 3rem;
+    }
+
+    .page-title {
+      font-size: 1.35rem;
+      font-weight: 700;
+      color: var(--white);
+      letter-spacing: -0.025em;
+      margin-bottom: 0.2rem;
+    }
+
+    .page-sub {
+      font-size: 0.85rem;
+      color: var(--text-3);
+      margin-bottom: 1.5rem;
+    }
+
+    /* ── Stat row ──────────────────────────────────────────────────────────── */
+    .stat-row {
       display: grid;
       grid-template-columns: repeat(4, 1fr);
+      gap: 1px;
+      background: var(--border);
       border: 1px solid var(--border);
-      border-top: none;
+      border-radius: 10px;
+      overflow: hidden;
+      margin-bottom: 1.5rem;
     }
 
     .stat-cell {
-      padding: 1.5rem 1.75rem;
-      border-right: 1px solid var(--border);
+      background: var(--card);
+      padding: 1.4rem 1.6rem;
     }
-    .stat-cell:last-child { border-right: none; }
 
-    .stat-label {
-      font-size: 0.72rem;
-      letter-spacing: 0.25em;
+    .stat-cell-label {
+      font-size: 0.78rem;
+      font-weight: 500;
+      color: var(--text-3);
       text-transform: uppercase;
-      color: var(--text-dim);
-      margin-bottom: 0.6rem;
+      letter-spacing: 0.06em;
+      margin-bottom: 0.5rem;
     }
 
-    .stat-value {
-      font-family: var(--serif);
-      font-size: 3.2rem;
-      font-weight: 300;
+    .stat-cell-value {
+      font-family: var(--mono);
+      font-size: 2.2rem;
+      font-weight: 600;
+      color: var(--white);
+      letter-spacing: -0.03em;
       line-height: 1;
-      color: var(--text-bright);
+      margin-bottom: 0.4rem;
       transition: color 0.3s;
     }
-    .stat-value.amber { color: var(--amber); }
-    .stat-value.dim   { color: var(--text-mid); }
 
-    .stat-sub {
-      font-size: 0.68rem;
-      color: var(--text-dim);
-      margin-top: 0.45rem;
-      letter-spacing: 0.08em;
+    .stat-cell-value.green { color: var(--green); }
+    .stat-cell-value.amber { color: var(--amber); }
+
+    .stat-cell-meta {
+      font-size: 0.78rem;
+      color: var(--text-3);
     }
 
-    /* ── Main content ── */
-    .content {
+    /* ── Main grid ─────────────────────────────────────────────────────────── */
+    .main-grid {
       display: grid;
-      grid-template-columns: 1fr 1fr 1fr;
-      flex: 1;
+      grid-template-columns: 1fr 380px;
+      gap: 1.5rem;
+      align-items: start;
     }
 
-    /* ── Section head ── */
-    .section-head {
-      font-size: 0.72rem;
-      letter-spacing: 0.25em;
-      text-transform: uppercase;
-      color: var(--text-dim);
-      padding: 0.85rem 1.75rem;
-      border-bottom: 1px solid var(--border);
-      border-top: 2px solid var(--amber-dim);
-      background: var(--bg-raised);
+    .left-col {
+      display: flex;
+      flex-direction: column;
+      gap: 1.5rem;
     }
 
-    .section-head.plain { border-top-color: var(--border); }
-
-    /* ── Workers ── */
-    .workers-panel {
-      grid-column: 1 / 3;
+    /* ── Card ──────────────────────────────────────────────────────────────── */
+    .card {
+      background: var(--card);
       border: 1px solid var(--border);
-      border-top: none;
-      border-right: none;
+      border-radius: 10px;
+      overflow: hidden;
+    }
+
+    .card-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 1.1rem 1.5rem;
+      border-bottom: 1px solid var(--border);
+    }
+
+    .card-title {
+      font-size: 0.95rem;
+      font-weight: 600;
+      color: var(--white);
+      letter-spacing: -0.01em;
+    }
+
+    .card-sub {
+      font-size: 0.78rem;
+      color: var(--text-3);
+      margin-top: 1px;
+    }
+
+    .pill {
+      background: var(--card-2);
+      border: 1px solid var(--border);
+      border-radius: 999px;
+      font-size: 0.72rem;
+      font-weight: 600;
+      color: var(--text-2);
+      padding: 0.2rem 0.65rem;
+      font-family: var(--mono);
+    }
+
+    /* ── Throughput chart ──────────────────────────────────────────────────── */
+    .chart-wrap {
+      padding: 1.25rem 1.5rem 1rem;
+      position: relative;
+    }
+
+    .chart-labels-y {
+      position: absolute;
+      left: 1.5rem;
+      top: 1.25rem;
+      bottom: 2.5rem;
+      display: flex;
+      flex-direction: column;
+      justify-content: space-between;
+    }
+
+    .chart-label-y {
+      font-family: var(--mono);
+      font-size: 0.65rem;
+      color: var(--text-3);
+      line-height: 1;
+    }
+
+    .chart-area {
+      margin-left: 2.5rem;
+      height: 180px;
+      position: relative;
+    }
+
+    canvas#throughputChart {
+      width: 100%;
+      height: 180px;
+    }
+
+    .chart-labels-x {
+      margin-left: 2.5rem;
+      display: flex;
+      justify-content: space-between;
+      margin-top: 0.5rem;
+      padding: 0 4px;
+    }
+
+    .chart-label-x {
+      font-family: var(--mono);
+      font-size: 0.65rem;
+      color: var(--text-3);
+    }
+
+    /* ── Worker table ──────────────────────────────────────────────────────── */
+    .worker-table {
+      width: 100%;
+    }
+
+    .worker-table-head {
+      display: grid;
+      grid-template-columns: 1fr 100px 120px 90px;
+      padding: 0.65rem 1.5rem;
+      background: var(--card-2);
+      border-bottom: 1px solid var(--border);
+    }
+
+    .wth {
+      font-size: 0.72rem;
+      font-weight: 600;
+      color: var(--text-3);
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
     }
 
     .worker-row {
       display: grid;
-      grid-template-columns: 10px 1fr auto 90px auto;
+      grid-template-columns: 1fr 100px 120px 90px;
+      padding: 0.85rem 1.5rem;
+      border-bottom: 1px solid var(--border);
       align-items: center;
-      gap: 1.25rem;
-      padding: 0.9rem 1.75rem;
-      border-bottom: 1px solid var(--bg-line);
-      transition: background 0.15s;
-      animation: rowIn 0.35s ease both;
-      opacity: 0;
+      transition: background 0.12s;
+      animation: fadeIn 0.3s ease both;
     }
-    @keyframes rowIn {
-      from { opacity:0; transform:translateX(-6px); }
-      to   { opacity:1; transform:translateX(0); }
-    }
-    .worker-row:hover { background: var(--bg-raised); }
-    .worker-row:last-child { border-bottom: none; }
 
-    .w-dot {
-      width: 8px; height: 8px;
+    @keyframes fadeIn {
+      from { opacity: 0; }
+      to   { opacity: 1; }
+    }
+
+    .worker-row:last-child { border-bottom: none; }
+    .worker-row:hover { background: var(--card-2); }
+
+    .wr-id {
+      font-family: var(--mono);
+      font-size: 0.82rem;
+      font-weight: 500;
+      color: var(--text);
+    }
+
+    .wr-id-sub {
+      font-size: 0.72rem;
+      color: var(--text-3);
+      margin-top: 2px;
+    }
+
+    .status-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.35rem;
+      border-radius: 4px;
+      padding: 0.28rem 0.65rem;
+      font-size: 0.75rem;
+      font-weight: 600;
+    }
+
+    .status-badge::before {
+      content: '';
+      width: 6px;
+      height: 6px;
       border-radius: 50%;
       flex-shrink: 0;
     }
-    .w-dot.idle { background: var(--green); box-shadow: 0 0 5px var(--green); }
-    .w-dot.busy { background: var(--amber); box-shadow: 0 0 5px var(--amber); animation: pulse 1.2s ease-in-out infinite; }
 
-    .w-id {
-      font-size: 0.7rem;
-      color: var(--text);
+    .status-badge.idle {
+      background: var(--green-bg);
+      color: var(--green);
+    }
+    .status-badge.idle::before { background: var(--green); }
+
+    .status-badge.busy {
+      background: var(--amber-bg);
+      color: var(--amber);
+    }
+    .status-badge.busy::before { background: var(--amber); }
+
+    .load-wrap {
+      display: flex;
+      align-items: center;
+      gap: 0.6rem;
+    }
+
+    .load-track {
+      flex: 1;
+      height: 4px;
+      background: var(--card-3);
+      border-radius: 999px;
       overflow: hidden;
-      text-overflow: ellipsis;
-      white-space: nowrap;
-    }
-    .w-id span { color: var(--text-dim); font-size: 0.62rem; margin-left: 0.4rem; }
-
-    .w-status {
-      font-size: 0.6rem;
-      color: var(--text-mid);
-      letter-spacing: 0.1em;
-      text-transform: uppercase;
-      white-space: nowrap;
     }
 
-    .w-bar-wrap { width: 90px; height: 2px; background: var(--border); }
-    .w-bar { height: 100%; background: var(--amber); transition: width 0.5s ease; }
+    .load-fill {
+      height: 100%;
+      border-radius: 999px;
+      transition: width 0.5s ease;
+    }
 
-    .w-seen {
-      font-size: 0.6rem;
-      color: var(--text-dim);
-      white-space: nowrap;
+    .load-fill.idle { background: var(--green); }
+    .load-fill.busy { background: var(--amber); }
+
+    .load-pct {
+      font-family: var(--mono);
+      font-size: 0.75rem;
+      color: var(--text-2);
+      min-width: 32px;
       text-align: right;
     }
 
-    .empty-state {
-      padding: 3rem 1.75rem;
-      font-size: 0.68rem;
-      color: var(--text-dim);
-      letter-spacing: 0.08em;
+    .wr-seen {
+      font-family: var(--mono);
+      font-size: 0.75rem;
+      color: var(--text-3);
     }
 
-    /* ── Log ── */
-    .log-panel {
-      grid-column: 3 / 4;
+    .empty-row {
+      padding: 2.5rem 1.5rem;
+      font-size: 0.85rem;
+      color: var(--text-3);
+      text-align: center;
+    }
+
+    /* ── Activity log ──────────────────────────────────────────────────────── */
+    .log-card {
+      background: var(--card);
       border: 1px solid var(--border);
-      border-top: none;
+      border-radius: 10px;
+      overflow: hidden;
+      position: sticky;
+      top: 72px;
+      max-height: calc(100vh - 100px);
       display: flex;
       flex-direction: column;
     }
 
-    .log-body {
-      flex: 1;
+    .log-scroll {
       overflow-y: auto;
-      max-height: 480px;
+      flex: 1;
     }
-    .log-body::-webkit-scrollbar { width: 2px; }
-    .log-body::-webkit-scrollbar-thumb { background: var(--border); }
 
-    .log-entry {
+    .log-scroll::-webkit-scrollbar { width: 3px; }
+    .log-scroll::-webkit-scrollbar-track { background: transparent; }
+    .log-scroll::-webkit-scrollbar-thumb { background: var(--border-2); border-radius: 999px; }
+
+    .log-row {
       display: grid;
-      grid-template-columns: 52px 1fr;
+      grid-template-columns: 16px 1fr auto;
       gap: 0.75rem;
-      padding: 0.55rem 1.25rem;
-      border-bottom: 1px solid var(--bg-line);
-      animation: logIn 0.25s ease both;
-    }
-    @keyframes logIn {
-      from { opacity:0; transform:translateY(-3px); }
-      to   { opacity:1; transform:translateY(0); }
+      align-items: start;
+      padding: 0.85rem 1.25rem;
+      border-bottom: 1px solid var(--border);
+      transition: background 0.12s;
+      animation: fadeIn 0.2s ease both;
     }
 
-    .log-time {
-      font-size: 0.58rem;
-      color: var(--text-dim);
-      letter-spacing: 0.04em;
-      padding-top: 2px;
+    .log-row:hover { background: var(--card-2); }
+    .log-row:last-child { border-bottom: none; }
+
+    .log-icon {
+      width: 16px;
+      height: 16px;
+      border-radius: 50%;
+      margin-top: 2px;
+      flex-shrink: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+
+    .log-icon.direct { background: var(--green-bg); }
+    .log-icon.queued { background: var(--card-3); }
+    .log-icon.error  { background: var(--red-bg); }
+
+    .log-icon-dot {
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+    }
+
+    .log-icon.direct .log-icon-dot { background: var(--green); }
+    .log-icon.queued .log-icon-dot { background: var(--text-3); }
+    .log-icon.error  .log-icon-dot { background: var(--red); }
+
+    .log-body-text { min-width: 0; }
+
+    .log-title {
+      font-size: 0.82rem;
+      font-weight: 600;
+      color: var(--text);
+      margin-bottom: 0.2rem;
       white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
     }
 
-    .log-content { display: flex; flex-direction: column; gap: 0.15rem; }
-
-    .log-type {
-      font-size: 0.6rem;
-      text-transform: uppercase;
-      letter-spacing: 0.12em;
-    }
-    .log-type.direct { color: var(--amber); }
-    .log-type.queued { color: var(--text); }
-    .log-type.error  { color: var(--red-bright); }
-    .log-type.info   { color: var(--text-dim); }
-
-    .log-detail {
-      font-size: 0.62rem;
-      color: var(--text-mid);
-      word-break: break-all;
-      line-height: 1.4;
+    .log-desc {
+      font-size: 0.75rem;
+      color: var(--text-3);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
     }
 
-    /* ── Modal ── */
+    .log-ts {
+      font-family: var(--mono);
+      font-size: 0.7rem;
+      color: var(--text-3);
+      white-space: nowrap;
+      padding-top: 2px;
+    }
+
+    .log-empty {
+      padding: 2.5rem 1.25rem;
+      text-align: center;
+      font-size: 0.85rem;
+      color: var(--text-3);
+    }
+
+    /* ── Modal ─────────────────────────────────────────────────────────────── */
     .backdrop {
       position: fixed; inset: 0;
-      background: rgba(14,14,11,0.85);
+      background: rgba(0,0,0,0.75);
       z-index: 500;
       display: flex;
       align-items: center;
       justify-content: center;
       opacity: 0;
       pointer-events: none;
-      transition: opacity 0.2s;
+      transition: opacity 0.18s;
     }
-    .backdrop.open { opacity:1; pointer-events:all; }
+
+    .backdrop.open { opacity: 1; pointer-events: all; }
 
     .modal {
-      background: var(--bg-raised);
-      border: 1px solid var(--border-mid);
-      border-top: 2px solid var(--amber);
+      background: var(--card);
+      border: 1px solid var(--border-2);
+      border-radius: 12px;
       width: 460px;
-      padding: 2rem;
+      padding: 1.75rem;
       transform: translateY(10px);
-      transition: transform 0.22s;
+      transition: transform 0.2s;
+      box-shadow: 0 32px 80px rgba(0,0,0,0.6);
     }
+
     .backdrop.open .modal { transform: translateY(0); }
 
     .modal-title {
-      font-family: var(--serif);
-      font-size: 1.5rem;
-      font-weight: 300;
-      color: var(--text-bright);
-      letter-spacing: 0.08em;
-      margin-bottom: 1.5rem;
+      font-size: 1.1rem;
+      font-weight: 700;
+      color: var(--white);
+      letter-spacing: -0.02em;
+      margin-bottom: 1.4rem;
     }
-    .modal-title em { font-style: italic; color: var(--amber); }
 
-    .field { margin-bottom: 1.1rem; }
+    .field { margin-bottom: 1rem; }
+
     .field label {
       display: block;
-      font-size: 0.58rem;
-      letter-spacing: 0.2em;
-      text-transform: uppercase;
-      color: var(--text-dim);
-      margin-bottom: 0.35rem;
+      font-size: 0.78rem;
+      font-weight: 600;
+      color: var(--text-2);
+      margin-bottom: 0.4rem;
+      letter-spacing: 0.01em;
     }
+
     .field input,
     .field select,
     .field textarea {
       width: 100%;
-      background: var(--bg);
-      border: 1px solid var(--border);
+      background: var(--card-2);
+      border: 1px solid var(--border-2);
+      border-radius: 6px;
       color: var(--text);
-      font-family: var(--mono);
-      font-size: 0.72rem;
-      padding: 0.55rem 0.75rem;
+      font-family: var(--sans);
+      font-size: 0.85rem;
+      padding: 0.65rem 0.9rem;
       outline: none;
-      transition: border-color 0.2s;
+      transition: border-color 0.15s;
       resize: vertical;
     }
+
     .field input:focus,
     .field select:focus,
-    .field textarea:focus { border-color: var(--amber-dim); }
-    .field select option { background: var(--bg-raised); }
+    .field textarea:focus { border-color: var(--green); }
+
+    .field select option { background: var(--card-2); }
 
     .modal-actions {
-      display: flex; gap: 0.75rem;
-      justify-content: flex-end;
-      margin-top: 1.5rem;
-    }
-
-    .btn {
-      background: none;
-      font-family: var(--mono);
-      font-size: 0.62rem;
-      letter-spacing: 0.15em;
-      text-transform: uppercase;
-      padding: 0.5rem 1.1rem;
-      cursor: pointer;
-      transition: background 0.15s, border-color 0.15s, color 0.15s;
-    }
-    .btn-cancel { border: 1px solid var(--border); color: var(--text-mid); }
-    .btn-cancel:hover { border-color: var(--border-mid); color: var(--text); }
-    .btn-submit {
-      border: 1px solid var(--amber-dim);
-      color: var(--amber);
-      background: var(--amber-glow);
-    }
-    .btn-submit:hover { background: rgba(212,137,26,0.18); border-color: var(--amber); }
-
-    /* ── Footer ── */
-    footer {
-      border-top: 1px solid var(--border);
-      padding: 1rem 0;
       display: flex;
-      justify-content: space-between;
-      align-items: center;
-      margin-top: auto;
+      gap: 0.65rem;
+      justify-content: flex-end;
+      margin-top: 1.4rem;
     }
-    .footer-txt { font-size: 0.58rem; color: var(--text-dim); letter-spacing: 0.12em; }
 
-    /* ── Toast ── */
+    .btn-ghost {
+      background: var(--card-2);
+      border: 1px solid var(--border-2);
+      border-radius: 6px;
+      color: var(--text-2);
+      font-family: var(--sans);
+      font-weight: 500;
+      font-size: 0.82rem;
+      padding: 0.55rem 1rem;
+      cursor: pointer;
+      transition: background 0.12s;
+    }
+
+    .btn-ghost:hover { background: var(--card-3); }
+
+    /* ── Toast ─────────────────────────────────────────────────────────────── */
     .toast {
       position: fixed;
-      bottom: 2rem; right: 2rem;
-      background: var(--bg-raised);
-      border: 1px solid var(--border-mid);
-      border-left: 2px solid var(--amber);
-      padding: 0.7rem 1.1rem;
-      font-size: 0.65rem;
+      bottom: 1.75rem;
+      right: 1.75rem;
+      background: var(--card-2);
+      border: 1px solid var(--border-2);
+      border-radius: 8px;
+      padding: 0.8rem 1.1rem;
+      font-size: 0.82rem;
+      font-weight: 500;
       color: var(--text);
       z-index: 600;
       transform: translateY(6px);
       opacity: 0;
-      transition: opacity 0.18s, transform 0.18s;
+      transition: opacity 0.15s, transform 0.15s;
       pointer-events: none;
-      max-width: 300px;
+      box-shadow: 0 8px 30px rgba(0,0,0,0.5);
+      display: flex;
+      align-items: center;
+      gap: 0.6rem;
     }
-    .toast.show { opacity:1; transform:translateY(0); }
-    .toast.err  { border-left-color: var(--red-bright); }
+
+    .toast-dot {
+      width: 7px;
+      height: 7px;
+      border-radius: 50%;
+      background: var(--green);
+      flex-shrink: 0;
+    }
+
+    .toast.show { opacity: 1; transform: translateY(0); }
+    .toast.err .toast-dot { background: var(--red); }
   </style>
 </head>
 <body>
 
-<div class="shell">
-  <header>
-    <div class="header-left">
-      <div class="wordmark">Her<em>mes</em></div>
-      <div class="system-label">Distributed Job Processing System</div>
-    </div>
-    <div class="header-center">
-      <div class="status-pill">
-        <div class="pulse-dot" id="sysDot"></div>
-        <span id="sysStatus">Connecting</span>
-      </div>
-      <div class="clock" id="clock">—</div>
-    </div>
-    <div class="header-right">
-      <button class="submit-btn" onclick="openModal()">+ Submit Job</button>
-    </div>
-  </header>
+<!-- Nav -->
+<div class="topbar">
+  <div class="brand">
+    <div class="brand-icon">H</div>
+    <div class="brand-name">Hermes</div>
+  </div>
 
-  <div class="stat-strip">
+  <div class="nav-tabs">
+    <div class="nav-tab active">Live Monitoring</div>
+    <div class="nav-tab">Workers</div>
+    <div class="nav-tab">Queue</div>
+    <div class="nav-tab">Dead Letter</div>
+  </div>
+
+  <div class="nav-right">
+    <div class="sys-status">
+      <div class="sys-dot" id="sysDot"></div>
+      <span id="sysStatus">Connecting…</span>
+    </div>
+    <button class="btn-submit" onclick="openModal()">+ Submit Job</button>
+  </div>
+</div>
+
+<div class="page">
+  <div class="page-title">Job Queue Monitor</div>
+  <div class="page-sub" id="clockLine">Loading…</div>
+
+  <!-- Stats -->
+  <div class="stat-row">
     <div class="stat-cell">
-      <div class="stat-label">Active Workers</div>
-      <div class="stat-value" id="sWorkers">—</div>
-      <div class="stat-sub">nodes registered</div>
+      <div class="stat-cell-label">Active Workers</div>
+      <div class="stat-cell-value green" id="sWorkers">—</div>
+      <div class="stat-cell-meta">nodes registered</div>
     </div>
     <div class="stat-cell">
-      <div class="stat-label">Idle</div>
-      <div class="stat-value" id="sIdle">—</div>
-      <div class="stat-sub">awaiting work</div>
+      <div class="stat-cell-label">Idle</div>
+      <div class="stat-cell-value" id="sIdle">—</div>
+      <div class="stat-cell-meta">awaiting work</div>
     </div>
     <div class="stat-cell">
-      <div class="stat-label">Busy</div>
-      <div class="stat-value amber" id="sBusy">—</div>
-      <div class="stat-sub">processing</div>
+      <div class="stat-cell-label">Busy</div>
+      <div class="stat-cell-value amber" id="sBusy">—</div>
+      <div class="stat-cell-meta">processing jobs</div>
     </div>
     <div class="stat-cell">
-      <div class="stat-label">Jobs This Session</div>
-      <div class="stat-value dim" id="sJobs">0</div>
-      <div class="stat-sub">submitted via dashboard</div>
+      <div class="stat-cell-label">Jobs This Session</div>
+      <div class="stat-cell-value" id="sJobs">0</div>
+      <div class="stat-cell-meta">submitted via dashboard</div>
     </div>
   </div>
 
-  <div class="content">
-    <div class="workers-panel">
-      <div class="section-head">Worker Fleet</div>
-      <div id="workersList"><div class="empty-state">Polling for workers…</div></div>
+  <!-- Main -->
+  <div class="main-grid">
+    <div class="left-col">
+
+      <!-- Throughput chart -->
+      <div class="card">
+        <div class="card-head">
+          <div>
+            <div class="card-title">Job Throughput</div>
+            <div class="card-sub">Jobs dispatched per poll interval</div>
+          </div>
+          <div class="pill" id="totalEventsLabel">0 total</div>
+        </div>
+        <div class="chart-wrap">
+          <div class="chart-area">
+            <canvas id="throughputChart"></canvas>
+          </div>
+          <div class="chart-labels-x" id="chartXLabels"></div>
+        </div>
+      </div>
+
+      <!-- Worker table -->
+      <div class="card">
+        <div class="card-head">
+          <div>
+            <div class="card-title">Worker Fleet</div>
+            <div class="card-sub">All registered nodes</div>
+          </div>
+          <div class="pill" id="workerCountPill">0 nodes</div>
+        </div>
+        <div class="worker-table">
+          <div class="worker-table-head">
+            <div class="wth">Worker ID</div>
+            <div class="wth">Status</div>
+            <div class="wth">Load</div>
+            <div class="wth">Last Seen</div>
+          </div>
+          <div id="workerRows">
+            <div class="empty-row">Polling for workers…</div>
+          </div>
+        </div>
+      </div>
+
     </div>
 
-    <div class="log-panel">
-      <div class="section-head plain">Activity Log</div>
-      <div class="log-body" id="logBody">
-        <div class="empty-state">Waiting for events…</div>
+    <!-- Activity log -->
+    <div class="log-card">
+      <div class="card-head">
+        <div>
+          <div class="card-title">Activity Log</div>
+          <div class="card-sub">All job events, newest first</div>
+        </div>
+        <div class="pill" id="logCountPill">0 events</div>
+      </div>
+      <div class="log-scroll" id="logScroll">
+        <div class="log-empty">Waiting for events…</div>
       </div>
     </div>
   </div>
-
-  <footer>
-    <div class="footer-txt">Hermes v1.0 — Philip Machar</div>
-    <div class="footer-txt" id="lastPoll">Last poll: —</div>
-  </footer>
 </div>
 
 <!-- Modal -->
 <div class="backdrop" id="backdrop">
   <div class="modal">
-    <div class="modal-title">Submit <em>Job</em></div>
+    <div class="modal-title">Submit Job</div>
     <div class="field">
       <label>Job Type</label>
       <select id="jobType">
@@ -533,43 +797,137 @@
       <textarea id="jobPayload" rows="5" placeholder='{"to":"user@example.com","subject":"Hello"}'></textarea>
     </div>
     <div class="modal-actions">
-      <button class="btn btn-cancel" onclick="closeModal()">Cancel</button>
-      <button class="btn btn-submit" onclick="submitJob()">Dispatch</button>
+      <button class="btn-ghost" onclick="closeModal()">Cancel</button>
+      <button class="btn-submit" onclick="submitJob()">Dispatch →</button>
     </div>
   </div>
 </div>
 
-<div class="toast" id="toast"></div>
+<div class="toast" id="toast">
+  <div class="toast-dot"></div>
+  <span id="toastMsg"></span>
+</div>
 
 <script>
-  // ── Constants ──────────────────────────────────────────────────────────────
-  const POLL_MS   = 3000;
-  const LOG_MAX   = 80;
+  const POLL_MS = 3000;
+  let sessionJobs  = 0;
+  let seenEventIDs = new Set();
+  let totalEvents  = 0;
 
-  // ── State ──────────────────────────────────────────────────────────────────
-  let sessionJobs    = 0;
-  let seenEventIDs   = new Set();   // deduplicate events from /events endpoint
-  let barStart       = null;
+  // Throughput ring — last 20 data points
+  const CHART_POINTS = 20;
+  let throughputData = Array(CHART_POINTS).fill(0);
+  let lastEventCount = 0;
 
   // ── Clock ──────────────────────────────────────────────────────────────────
   function tickClock() {
-    document.getElementById('clock').textContent =
-      new Date().toUTCString().replace('GMT','UTC');
+    const n = new Date();
+    document.getElementById('clockLine').textContent =
+      n.toLocaleDateString('en-US', { weekday:'long', year:'numeric', month:'long', day:'numeric' }) +
+      '  ·  ' + n.toLocaleTimeString('en-GB', { hour12: false }) + ' UTC';
   }
   tickClock();
   setInterval(tickClock, 1000);
 
-  // ── Poll /workers ──────────────────────────────────────────────────────────
+  // ── Chart ──────────────────────────────────────────────────────────────────
+  function drawChart() {
+    const canvas = document.getElementById('throughputChart');
+    const dpr    = window.devicePixelRatio || 1;
+    const w      = canvas.offsetWidth  || canvas.parentElement.offsetWidth;
+    const h      = 180;
+
+    canvas.width  = w * dpr;
+    canvas.height = h * dpr;
+    canvas.style.width  = w + 'px';
+    canvas.style.height = h + 'px';
+
+    const ctx = canvas.getContext('2d');
+    ctx.scale(dpr, dpr);
+    ctx.clearRect(0, 0, w, h);
+
+    const pad   = { top: 12, right: 8, bottom: 24, left: 40 };
+    const cw    = w - pad.left - pad.right;
+    const ch    = h - pad.top  - pad.bottom;
+    const max   = Math.max(...throughputData, 1);
+    const step  = cw / (CHART_POINTS - 1);
+
+    // Grid lines
+    ctx.strokeStyle = '#1e1e1e';
+    ctx.lineWidth   = 1;
+    for (let i = 0; i <= 4; i++) {
+      const y = pad.top + (ch / 4) * i;
+      ctx.beginPath();
+      ctx.moveTo(pad.left, y);
+      ctx.lineTo(pad.left + cw, y);
+      ctx.stroke();
+
+      // Y labels
+      const val = Math.round(max - (max / 4) * i);
+      ctx.fillStyle = '#555';
+      ctx.font = '10px JetBrains Mono, monospace';
+      ctx.textAlign = 'right';
+      ctx.fillText(val, pad.left - 6, y + 4);
+    }
+
+    // Build path
+    const pts = throughputData.map((v, i) => ({
+      x: pad.left + i * step,
+      y: pad.top + ch - (v / max) * ch,
+    }));
+
+    // Fill
+    const grad = ctx.createLinearGradient(0, pad.top, 0, pad.top + ch);
+    grad.addColorStop(0,   'rgba(0,200,83,0.25)');
+    grad.addColorStop(1,   'rgba(0,200,83,0)');
+
+    ctx.beginPath();
+    ctx.moveTo(pts[0].x, pts[0].y);
+    for (let i = 1; i < pts.length; i++) {
+      const mx = (pts[i-1].x + pts[i].x) / 2;
+      ctx.bezierCurveTo(mx, pts[i-1].y, mx, pts[i].y, pts[i].x, pts[i].y);
+    }
+    ctx.lineTo(pts[pts.length-1].x, pad.top + ch);
+    ctx.lineTo(pts[0].x, pad.top + ch);
+    ctx.closePath();
+    ctx.fillStyle = grad;
+    ctx.fill();
+
+    // Line
+    ctx.beginPath();
+    ctx.moveTo(pts[0].x, pts[0].y);
+    for (let i = 1; i < pts.length; i++) {
+      const mx = (pts[i-1].x + pts[i].x) / 2;
+      ctx.bezierCurveTo(mx, pts[i-1].y, mx, pts[i].y, pts[i].x, pts[i].y);
+    }
+    ctx.strokeStyle = '#00c853';
+    ctx.lineWidth   = 2;
+    ctx.stroke();
+
+    // Latest dot
+    const last = pts[pts.length - 1];
+    ctx.beginPath();
+    ctx.arc(last.x, last.y, 4, 0, Math.PI * 2);
+    ctx.fillStyle   = '#00c853';
+    ctx.fill();
+    ctx.strokeStyle = '#000';
+    ctx.lineWidth   = 1.5;
+    ctx.stroke();
+
+    // X labels — time markers
+    const xLabels = document.getElementById('chartXLabels');
+    xLabels.style.marginLeft = pad.left + 'px';
+    xLabels.style.paddingRight = pad.right + 'px';
+  }
+
+  // ── Poll workers ───────────────────────────────────────────────────────────
   async function pollWorkers() {
     try {
       const res  = await fetch('/workers');
-      if (!res.ok) throw new Error('HTTP ' + res.status);
+      if (!res.ok) throw new Error();
       const data = await res.json();
       renderWorkers(data);
       setStatus(data.count > 0);
-    } catch(e) {
-      setStatus(false);
-    }
+    } catch { setStatus(false); }
   }
 
   function renderWorkers(data) {
@@ -580,84 +938,108 @@
     document.getElementById('sWorkers').textContent = data.count ?? 0;
     document.getElementById('sIdle').textContent    = idle;
     document.getElementById('sBusy').textContent    = busy;
+    document.getElementById('workerCountPill').textContent = (data.count ?? 0) + ' nodes';
 
-    const list = document.getElementById('workersList');
+    const rows = document.getElementById('workerRows');
     if (!workers.length) {
-      list.innerHTML = '<div class="empty-state">No workers registered.</div>';
+      rows.innerHTML = '<div class="empty-row">No workers registered.</div>';
       return;
     }
 
-    list.innerHTML = workers.map((w, i) => {
+    rows.innerHTML = workers.map((w, i) => {
       const loadPct = Math.min(w.load * 20, 100);
       const short   = w.worker_id.length > 20
         ? w.worker_id.slice(0,8) + '…' + w.worker_id.slice(-6)
         : w.worker_id;
       return `
-        <div class="worker-row" style="animation-delay:${i*0.04}s">
-          <div class="w-dot ${w.status}"></div>
-          <div class="w-id">${short}<span>${w.status}</span></div>
-          <div class="w-status">${w.status}</div>
-          <div class="w-bar-wrap"><div class="w-bar" style="width:${loadPct}%"></div></div>
-          <div class="w-seen">${timeSince(w.last_seen_unix)}</div>
+        <div class="worker-row" style="animation-delay:${i * 0.04}s">
+          <div>
+            <div class="wr-id">${short}</div>
+            <div class="wr-id-sub">Last seen ${timeSince(w.last_seen_unix)}</div>
+          </div>
+          <div><span class="status-badge ${w.status}">${w.status}</span></div>
+          <div class="load-wrap">
+            <div class="load-track">
+              <div class="load-fill ${w.status}" style="width:${loadPct}%"></div>
+            </div>
+            <span class="load-pct">${loadPct}%</span>
+          </div>
+          <div class="wr-seen">${timeSince(w.last_seen_unix)}</div>
         </div>`;
     }).join('');
   }
 
   function setStatus(online) {
-    const dot  = document.getElementById('sysDot');
-    const txt  = document.getElementById('sysStatus');
-    dot.style.background = online ? 'var(--green)' : 'var(--amber)';
-    txt.textContent      = online ? 'Operational' : 'No workers';
+    const dot = document.getElementById('sysDot');
+    const txt = document.getElementById('sysStatus');
+    if (online) {
+      dot.className = 'sys-dot';
+      txt.textContent = 'Operational';
+    } else {
+      dot.className = 'sys-dot warn';
+      txt.textContent = 'No workers';
+    }
   }
 
-  // ── Poll /events ───────────────────────────────────────────────────────────
+  // ── Poll events ────────────────────────────────────────────────────────────
   async function pollEvents() {
     try {
       const res  = await fetch('/events');
-      if (!res.ok) throw new Error('HTTP ' + res.status);
+      if (!res.ok) throw new Error();
       const data = await res.json();
-      renderEvents(data.events || []);
-      document.getElementById('lastPoll').textContent =
-        'Last poll: ' + new Date().toLocaleTimeString();
-    } catch(e) { /* silent */ }
+      const newCount = renderEvents(data.events || []);
+
+      // Update throughput
+      const delta = totalEvents - lastEventCount;
+      lastEventCount = totalEvents;
+      throughputData.push(delta);
+      throughputData.shift();
+      drawChart();
+      document.getElementById('totalEventsLabel').textContent = totalEvents + ' total';
+    } catch { /* silent */ }
   }
 
   function renderEvents(evts) {
-    const body = document.getElementById('logBody');
-    let hasNew = false;
+    const scroll = document.getElementById('logScroll');
+    let added = 0;
 
-    // evts arrive newest-first from the server; process in that order
-    // so we prepend them in order.
     for (const e of evts) {
-      // Use time+jobID as a stable dedup key.
       const key = e.time + '|' + e.job_id;
       if (seenEventIDs.has(key)) continue;
       seenEventIDs.add(key);
-      hasNew = true;
+      totalEvents++;
+      added++;
 
-      const t    = new Date(e.time);
-      const hms  = t.toLocaleTimeString('en-GB', { hour12: false });
-      const div  = document.createElement('div');
-      div.className = 'log-entry';
+      const t   = new Date(e.time);
+      const hms = t.toLocaleTimeString('en-GB', { hour12: false });
+      const typeLabel = e.kind === 'direct' ? 'Direct Dispatch'
+                      : e.kind === 'queued' ? 'Queued'
+                      : e.kind === 'error'  ? 'Error'
+                      : 'Info';
+
+      const div = document.createElement('div');
+      div.className = 'log-row';
       div.innerHTML = `
-        <div class="log-time">${hms}</div>
-        <div class="log-content">
-          <div class="log-type ${e.kind}">${e.kind}</div>
-          <div class="log-detail">${e.job_type} · ${e.job_id.slice(0,8)}… · ${e.message}</div>
-        </div>`;
+        <div class="log-icon ${e.kind}"><div class="log-icon-dot"></div></div>
+        <div class="log-body-text">
+          <div class="log-title">${typeLabel} · ${e.job_type}</div>
+          <div class="log-desc">${e.job_id.slice(0,8)}… · ${e.message}</div>
+        </div>
+        <div class="log-ts">${hms}</div>`;
 
-      // Remove placeholder if present.
-      const placeholder = body.querySelector('.empty-state');
+      const placeholder = scroll.querySelector('.log-empty');
       if (placeholder) placeholder.remove();
-
-      body.prepend(div);
+      scroll.prepend(div);
     }
 
-    // Trim to max.
-    while (body.children.length > LOG_MAX) body.removeChild(body.lastChild);
+    if (added > 0) {
+      document.getElementById('logCountPill').textContent = totalEvents + ' events';
+    }
 
-    // Keep seenEventIDs from growing unbounded.
     if (seenEventIDs.size > 500) seenEventIDs.clear();
+    while (scroll.children.length > 80) scroll.removeChild(scroll.lastChild);
+
+    return added;
   }
 
   // ── Combined poll ──────────────────────────────────────────────────────────
@@ -665,7 +1047,7 @@
     await Promise.all([pollWorkers(), pollEvents()]);
   }
 
-  // ── Submit job ─────────────────────────────────────────────────────────────
+  // ── Modal ──────────────────────────────────────────────────────────────────
   function openModal()  { document.getElementById('backdrop').classList.add('open'); }
   function closeModal() { document.getElementById('backdrop').classList.remove('open'); }
 
@@ -683,22 +1065,19 @@
 
     try {
       const res = await fetch('/jobs', {
-        method: 'POST',
+        method:  'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ type, payload }),
+        body:    JSON.stringify({ type, payload }),
       });
       if (!res.ok) throw new Error('HTTP ' + res.status);
       const data = await res.json();
-
       sessionJobs++;
       document.getElementById('sJobs').textContent = sessionJobs;
-
-      showToast('Job dispatched — ' + data.routed);
+      showToast('Dispatched — ' + data.routed);
       closeModal();
-      // Immediate poll so the new event appears right away.
-      setTimeout(poll, 200);
+      setTimeout(poll, 250);
     } catch(e) {
-      showToast('Dispatch failed: ' + e.message, true);
+      showToast('Failed: ' + e.message, true);
     }
   }
 
@@ -706,8 +1085,8 @@
   let toastTimer;
   function showToast(msg, err = false) {
     const t = document.getElementById('toast');
-    t.textContent = msg;
-    t.className   = 'toast show' + (err ? ' err' : '');
+    document.getElementById('toastMsg').textContent = msg;
+    t.className = 'toast show' + (err ? ' err' : '');
     clearTimeout(toastTimer);
     toastTimer = setTimeout(() => { t.className = 'toast'; }, 3000);
   }
@@ -721,6 +1100,8 @@
   }
 
   // ── Init ───────────────────────────────────────────────────────────────────
+  drawChart();
+  window.addEventListener('resize', drawChart);
   poll();
   setInterval(poll, POLL_MS);
 </script>

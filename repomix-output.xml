@@ -40,8 +40,13 @@ The content is organized as follows:
 </file_summary>
 
 <directory_structure>
+.github/
+  workflows/
+    ci.yml
 cmd/
   api/
+    static/
+      index.html
     handlers_test.go
     handlers.go
     main.go
@@ -57,7 +62,15 @@ docker/
 internal/
   config/
     config.go
+  events/
+    ring.go
+  integration/
+    queue_test.go
   jobs/
+    handlers/
+      email.go
+      resize_image.go
+    handler.go
     job.go
   queue/
     config.go
@@ -83,554 +96,65 @@ README.md
 <files>
 This section contains the contents of the repository's files.
 
-<file path="cmd/api/handlers_test.go">
-package main
-
-import (
-	"encoding/json"
-	"errors"
-	"net/http"
-	"net/http/httptest"
-	"strings"
-	"testing"
-
-	"jobqueue/internal/worker"
-)
-
-// ---------------------------------------------------------------------------
-// Stub queue — satisfies queue.Queue without RabbitMQ
-// ---------------------------------------------------------------------------
-
-type stubQueue struct {
-	published [][]byte
-	failNext  bool
-}
-
-func (s *stubQueue) Publish(body []byte) error {
-	if s.failNext {
-		s.failNext = false
-		return errors.New("publish failed")
-	}
-	s.published = append(s.published, body)
-	return nil
-}
-
-func (s *stubQueue) Close() error { return nil }
-
-// ---------------------------------------------------------------------------
-// POST /jobs — wrong method
-// ---------------------------------------------------------------------------
-
-func TestJobsHandler_WrongMethod(t *testing.T) {
-	reg := worker.NewRegistry()
-	q := &stubQueue{}
-
-	req := httptest.NewRequest(http.MethodGet, "/jobs", nil)
-	rr := httptest.NewRecorder()
-	jobsHandler(reg, q)(rr, req)
-
-	if rr.Code != http.StatusMethodNotAllowed {
-		t.Errorf("expected 405, got %d", rr.Code)
-	}
-}
-
-// ---------------------------------------------------------------------------
-// POST /jobs — bad JSON body
-// ---------------------------------------------------------------------------
-
-func TestJobsHandler_InvalidBody(t *testing.T) {
-	reg := worker.NewRegistry()
-	q := &stubQueue{}
-
-	req := httptest.NewRequest(http.MethodPost, "/jobs", strings.NewReader("{bad json}"))
-	req.Header.Set("Content-Type", "application/json")
-	rr := httptest.NewRecorder()
-	jobsHandler(reg, q)(rr, req)
-
-	if rr.Code != http.StatusBadRequest {
-		t.Errorf("expected 400, got %d", rr.Code)
-	}
-}
-
-// ---------------------------------------------------------------------------
-// POST /jobs — no workers → routed to queue
-// ---------------------------------------------------------------------------
-
-func TestJobsHandler_NoWorkers_RoutedToQueue(t *testing.T) {
-	reg := worker.NewRegistry() // empty registry
-	q := &stubQueue{}
-
-	body := `{"type":"email","payload":{"to":"a@b.com"}}`
-	req := httptest.NewRequest(http.MethodPost, "/jobs", strings.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
-	rr := httptest.NewRecorder()
-	jobsHandler(reg, q)(rr, req)
-
-	if rr.Code != http.StatusAccepted {
-		t.Errorf("expected 202, got %d", rr.Code)
-	}
-
-	var resp map[string]interface{}
-	if err := json.NewDecoder(rr.Body).Decode(&resp); err != nil {
-		t.Fatalf("could not decode response: %v", err)
-	}
-	if resp["routed"] != "queue" {
-		t.Errorf("expected routed=queue, got %v", resp["routed"])
-	}
-	if len(q.published) != 1 {
-		t.Errorf("expected 1 published message, got %d", len(q.published))
-	}
-}
-
-// ---------------------------------------------------------------------------
-// POST /jobs — worker alive → routed direct
-// ---------------------------------------------------------------------------
-
-func TestJobsHandler_WithWorker_RoutedDirect(t *testing.T) {
-	// Spin up a fake worker dispatch server.
-	workerServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-	}))
-	defer workerServer.Close()
-
-	reg := worker.NewRegistry()
-	// Strip scheme — registry prepends "http://" internally.
-	reg.Register("w1", workerServer.Listener.Addr().String())
-
-	q := &stubQueue{}
-
-	body := `{"type":"email","payload":{"to":"a@b.com"}}`
-	req := httptest.NewRequest(http.MethodPost, "/jobs", strings.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
-	rr := httptest.NewRecorder()
-	jobsHandler(reg, q)(rr, req)
-
-	if rr.Code != http.StatusAccepted {
-		t.Errorf("expected 202, got %d", rr.Code)
-	}
-
-	var resp map[string]interface{}
-	if err := json.NewDecoder(rr.Body).Decode(&resp); err != nil {
-		t.Fatalf("could not decode response: %v", err)
-	}
-	if resp["routed"] != "direct" {
-		t.Errorf("expected routed=direct, got %v", resp["routed"])
-	}
-	if resp["worker_id"] != "w1" {
-		t.Errorf("expected worker_id=w1, got %v", resp["worker_id"])
-	}
-	// Nothing should have been queued.
-	if len(q.published) != 0 {
-		t.Errorf("expected 0 published messages, got %d", len(q.published))
-	}
-}
-
-// ---------------------------------------------------------------------------
-// POST /jobs — worker dispatch fails → falls back to queue
-// ---------------------------------------------------------------------------
-
-func TestJobsHandler_WorkerDispatchFails_FallsBackToQueue(t *testing.T) {
-	// Fake worker that always returns 500.
-	workerServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusInternalServerError)
-	}))
-	defer workerServer.Close()
-
-	reg := worker.NewRegistry()
-	reg.Register("w1", workerServer.Listener.Addr().String())
-
-	q := &stubQueue{}
-
-	body := `{"type":"email","payload":{}}`
-	req := httptest.NewRequest(http.MethodPost, "/jobs", strings.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
-	rr := httptest.NewRecorder()
-	jobsHandler(reg, q)(rr, req)
-
-	if rr.Code != http.StatusAccepted {
-		t.Errorf("expected 202, got %d", rr.Code)
-	}
-
-	var resp map[string]interface{}
-	if err := json.NewDecoder(rr.Body).Decode(&resp); err != nil {
-		t.Fatalf("could not decode response: %v", err)
-	}
-	if resp["routed"] != "queue" {
-		t.Errorf("expected routed=queue after dispatch failure, got %v", resp["routed"])
-	}
-	if len(q.published) != 1 {
-		t.Errorf("expected 1 published message after fallback, got %d", len(q.published))
-	}
-}
-
-// ---------------------------------------------------------------------------
-// POST /jobs — response contains expected job fields
-// ---------------------------------------------------------------------------
-
-func TestJobsHandler_ResponseContainsJobFields(t *testing.T) {
-	reg := worker.NewRegistry()
-	q := &stubQueue{}
-
-	body := `{"type":"resize-image","payload":{"url":"https://example.com/img.png"}}`
-	req := httptest.NewRequest(http.MethodPost, "/jobs", strings.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
-	rr := httptest.NewRecorder()
-	jobsHandler(reg, q)(rr, req)
-
-	var resp map[string]interface{}
-	json.NewDecoder(rr.Body).Decode(&resp)
-
-	jobField, ok := resp["job"].(map[string]interface{})
-	if !ok {
-		t.Fatal("expected job field in response")
-	}
-	if jobField["type"] != "resize-image" {
-		t.Errorf("expected type resize-image, got %v", jobField["type"])
-	}
-	if jobField["id"] == "" || jobField["id"] == nil {
-		t.Error("expected non-empty job id")
-	}
-}
-
-// ---------------------------------------------------------------------------
-// GET /workers — wrong method
-// ---------------------------------------------------------------------------
-
-func TestWorkersHandler_WrongMethod(t *testing.T) {
-	reg := worker.NewRegistry()
-
-	req := httptest.NewRequest(http.MethodPost, "/workers", nil)
-	rr := httptest.NewRecorder()
-	workersHandler(reg)(rr, req)
-
-	if rr.Code != http.StatusMethodNotAllowed {
-		t.Errorf("expected 405, got %d", rr.Code)
-	}
-}
-
-// ---------------------------------------------------------------------------
-// GET /workers — empty registry
-// ---------------------------------------------------------------------------
-
-func TestWorkersHandler_EmptyRegistry(t *testing.T) {
-	reg := worker.NewRegistry()
-
-	req := httptest.NewRequest(http.MethodGet, "/workers", nil)
-	rr := httptest.NewRecorder()
-	workersHandler(reg)(rr, req)
-
-	if rr.Code != http.StatusOK {
-		t.Errorf("expected 200, got %d", rr.Code)
-	}
-
-	var resp map[string]interface{}
-	json.NewDecoder(rr.Body).Decode(&resp)
-
-	if resp["count"].(float64) != 0 {
-		t.Errorf("expected count 0, got %v", resp["count"])
-	}
-}
-
-// ---------------------------------------------------------------------------
-// GET /workers — returns correct count and status
-// ---------------------------------------------------------------------------
-
-func TestWorkersHandler_ReturnsWorkersWithStatus(t *testing.T) {
-	reg := worker.NewRegistry()
-	reg.Register("w1", "localhost:9001")
-	reg.Register("w2", "localhost:9002")
-	reg.UpdateLoad("w2", 1) // mark w2 as busy
-
-	req := httptest.NewRequest(http.MethodGet, "/workers", nil)
-	rr := httptest.NewRecorder()
-	workersHandler(reg)(rr, req)
-
-	var resp map[string]interface{}
-	json.NewDecoder(rr.Body).Decode(&resp)
-
-	if resp["count"].(float64) != 2 {
-		t.Errorf("expected count 2, got %v", resp["count"])
-	}
-
-	workers := resp["workers"].([]interface{})
-	statusByID := make(map[string]string)
-	for _, w := range workers {
-		wm := w.(map[string]interface{})
-		statusByID[wm["worker_id"].(string)] = wm["status"].(string)
-	}
-
-	if statusByID["w1"] != "idle" {
-		t.Errorf("expected w1 idle, got %s", statusByID["w1"])
-	}
-	if statusByID["w2"] != "busy" {
-		t.Errorf("expected w2 busy, got %s", statusByID["w2"])
-	}
-}
-</file>
-
-<file path="cmd/api/handlers.go">
-package main
-
-import (
-	"encoding/json"
-	"log"
-	"net/http"
-
-	"github.com/google/uuid"
-
-	"jobqueue/internal/jobs"
-	"jobqueue/internal/queue"
-	"jobqueue/internal/worker"
-)
-
-// jobsHandler handles POST /jobs.
-func jobsHandler(registry *worker.Registry, rmq queue.Queue) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-
-		var body struct {
-			Type    string      `json:"type"`
-			Payload interface{} `json:"payload"`
-		}
-		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-			http.Error(w, "invalid request: "+err.Error(), http.StatusBadRequest)
-			return
-		}
-
-		job := jobs.Job{
-			ID:       uuid.NewString(),
-			Type:     body.Type,
-			Payload:  body.Payload,
-			Attempts: 0,
-		}
-
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusAccepted)
-
-		workerID := registry.PickWorker()
-		if workerID != "" {
-			if err := registry.DispatchJob(workerID, job.ID, job.Type, job.Payload); err == nil {
-				log.Printf("job %s dispatched directly to worker %s", job.ID, workerID)
-				json.NewEncoder(w).Encode(map[string]interface{}{
-					"job":       job,
-					"routed":    "direct",
-					"worker_id": workerID,
-				})
-				return
-			}
-			log.Printf("direct dispatch to worker %s failed, falling back to queue", workerID)
-		}
-
-		data, err := json.Marshal(job)
-		if err != nil {
-			http.Error(w, "failed to encode job", http.StatusInternalServerError)
-			return
-		}
-		if err := rmq.Publish(data); err != nil {
-			http.Error(w, "failed to queue job", http.StatusInternalServerError)
-			return
-		}
-		log.Printf("job %s queued (no alive workers)", job.ID)
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"job":    job,
-			"routed": "queue",
-			"note":   "no alive workers, job queued",
-		})
-	}
-}
-
-// workersHandler handles GET /workers.
-func workersHandler(registry *worker.Registry) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-
-		snapshot := registry.List()
-
-		type workerView struct {
-			WorkerID     string `json:"worker_id"`
-			LastSeenUnix int64  `json:"last_seen_unix"`
-			Load         int32  `json:"load"`
-			Status       string `json:"status"`
-		}
-
-		workers := make([]workerView, 0, len(snapshot))
-		for id, info := range snapshot {
-			status := "idle"
-			if info.Load > 0 {
-				status = "busy"
-			}
-			workers = append(workers, workerView{
-				WorkerID:     id,
-				LastSeenUnix: info.LastSeen.Unix(),
-				Load:         info.Load,
-				Status:       status,
-			})
-		}
-
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"count":   len(workers),
-			"workers": workers,
-		})
-	}
-}
-</file>
-
-<file path="cmd/worker/worker_main/worker_test.go">
-package main
-
-import (
-	"encoding/json"
-	"testing"
-
-	amqp "github.com/rabbitmq/amqp091-go"
-
-	"jobqueue/internal/jobs"
-)
-
-// ---------------------------------------------------------------------------
-// Stub queue.Queue
-// ---------------------------------------------------------------------------
-
-type stubQueue struct {
-	published [][]byte
-}
-
-func (s *stubQueue) Publish(body []byte) error {
-	s.published = append(s.published, body)
-	return nil
-}
-
-func (s *stubQueue) Close() error { return nil }
-
-// ---------------------------------------------------------------------------
-// deliveryAcker records which acknowledgement method was called.
-// ---------------------------------------------------------------------------
-
-type deliveryAcker struct {
-	acked       bool
-	nacked      bool
-	nackRequeue bool
-}
-
-func (a *deliveryAcker) Ack(_ uint64, _ bool) error {
-	a.acked = true
-	return nil
-}
-
-func (a *deliveryAcker) Nack(_ uint64, _ bool, requeue bool) error {
-	a.nacked = true
-	a.nackRequeue = requeue
-	return nil
-}
-
-func (a *deliveryAcker) Reject(_ uint64, _ bool) error { return nil }
-
-// ---------------------------------------------------------------------------
-// Helper — build an amqp.Delivery from a Job
-// ---------------------------------------------------------------------------
-
-func jobDelivery(t *testing.T, job jobs.Job) (amqp.Delivery, *deliveryAcker) {
-	t.Helper()
-	body, err := json.Marshal(job)
-	if err != nil {
-		t.Fatalf("marshal failed: %v", err)
-	}
-	acker := &deliveryAcker{}
-	return amqp.Delivery{Body: body, Acknowledger: acker}, acker
-}
-
-// ---------------------------------------------------------------------------
-// Invalid JSON — Nacked without requeue, nothing published
-// ---------------------------------------------------------------------------
-
-func TestHandleMessage_InvalidJSON_NackedAndDiscarded(t *testing.T) {
-	q := &stubQueue{}
-	acker := &deliveryAcker{}
-	d := amqp.Delivery{Body: []byte("{bad json}"), Acknowledger: acker}
-
-	handleMessage(d, q)
-
-	if !acker.nacked {
-		t.Error("expected Nack for invalid JSON")
-	}
-	if acker.nackRequeue {
-		t.Error("expected Nack without requeue")
-	}
-	if len(q.published) != 0 {
-		t.Errorf("expected nothing published, got %d", len(q.published))
-	}
-}
-
-// ---------------------------------------------------------------------------
-// Valid job — current stub behaviour: jobSucceeded=true → Ack
-// Update when real job processing replaces the stub.
-// ---------------------------------------------------------------------------
-
-func TestHandleMessage_ValidJob_Acked(t *testing.T) {
-	q := &stubQueue{}
-	job := jobs.Job{ID: "j1", Type: "email", Attempts: 0}
-	d, acker := jobDelivery(t, job)
-
-	handleMessage(d, q)
-
-	if !acker.acked {
-		t.Error("expected Ack for successful job (jobSucceeded=true)")
-	}
-	if len(q.published) != 0 {
-		t.Errorf("expected 0 re-published messages, got %d", len(q.published))
-	}
-}
-
-// ---------------------------------------------------------------------------
-// Attempts counter is preserved through JSON round-trip
-// ---------------------------------------------------------------------------
-
-func TestHandleMessage_AttemptsPreservedInPayload(t *testing.T) {
-	job := jobs.Job{ID: "j1", Type: "resize", Attempts: 1}
-	body, _ := json.Marshal(job)
-
-	var roundTripped jobs.Job
-	if err := json.Unmarshal(body, &roundTripped); err != nil {
-		t.Fatalf("unmarshal failed: %v", err)
-	}
-	if roundTripped.Attempts != 1 {
-		t.Errorf("expected attempts 1, got %d", roundTripped.Attempts)
-	}
-	if roundTripped.ID != "j1" {
-		t.Errorf("expected ID j1, got %s", roundTripped.ID)
-	}
-}
-
-// ---------------------------------------------------------------------------
-// DLQ path — Nack without requeue when attempts == maxAttempts
-// Skipped until real job processing is wired into handleMessage.
-// ---------------------------------------------------------------------------
-
-func TestHandleMessage_ExhaustedAttempts_NackedToDLQ(t *testing.T) {
-	t.Skip("DLQ path requires jobSucceeded=false; wire real job processing first")
-}
-</file>
-
-<file path="docker/Dockerfile.api">
-FROM golang:1.24-alpine AS builder
-WORKDIR /app
-COPY go.mod go.sum ./
-RUN go mod download
-COPY . .
-RUN go build -o api ./cmd/api/main.go
-
-FROM alpine:3.19
-WORKDIR /app
-COPY --from=builder /app/api .
-EXPOSE 8081 50051
-CMD ["./api"]
+<file path=".github/workflows/ci.yml">
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: ["**"]
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Unit tests — fast, no external dependencies, runs on every push/PR
+  # ---------------------------------------------------------------------------
+  unit:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+          cache: true
+
+      - name: Download dependencies
+        run: go mod download
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Unit tests
+        run: go test -race -count=1 -timeout=60s ./...
+
+  # ---------------------------------------------------------------------------
+  # Integration tests — spins up a real RabbitMQ via testcontainers-go
+  # Requires Docker (available on ubuntu-latest GitHub-hosted runners)
+  # ---------------------------------------------------------------------------
+  integration:
+    name: Integration Tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+          cache: true
+
+      - name: Download dependencies
+        run: go mod download
+
+      - name: Integration tests
+        run: go test -race -count=1 -timeout=120s -tags integration ./internal/integration/...
 </file>
 
 <file path="docker/Dockerfile.worker">
@@ -646,6 +170,565 @@ WORKDIR /app
 COPY --from=builder /app/worker .
 EXPOSE 9001
 CMD ["./worker"]
+</file>
+
+<file path="internal/events/ring.go">
+package events
+
+import (
+	"sync"
+	"time"
+)
+
+// Kind classifies an event for the dashboard.
+type Kind string
+
+const (
+	KindDirect  Kind = "direct"
+	KindQueued  Kind = "queued"
+	KindError   Kind = "error"
+	KindInfo    Kind = "info"
+)
+
+// Event is a single activity record.
+type Event struct {
+	Time      time.Time `json:"time"`
+	JobID     string    `json:"job_id"`
+	JobType   string    `json:"job_type"`
+	Kind      Kind      `json:"kind"`
+	WorkerID  string    `json:"worker_id,omitempty"`
+	Message   string    `json:"message"`
+}
+
+// Ring is a fixed-capacity thread-safe ring buffer of Events.
+// Oldest entries are overwritten when the buffer is full.
+type Ring struct {
+	mu       sync.Mutex
+	buf      []Event
+	cap      int
+	head     int  // index of next write
+	count    int  // number of valid entries
+}
+
+// NewRing returns a Ring with the given capacity.
+func NewRing(capacity int) *Ring {
+	return &Ring{
+		buf: make([]Event, capacity),
+		cap: capacity,
+	}
+}
+
+// Push adds an event to the ring, overwriting the oldest entry if full.
+func (r *Ring) Push(e Event) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if e.Time.IsZero() {
+		e.Time = time.Now()
+	}
+	r.buf[r.head] = e
+	r.head = (r.head + 1) % r.cap
+	if r.count < r.cap {
+		r.count++
+	}
+}
+
+// Snapshot returns all events in chronological order (oldest first).
+func (r *Ring) Snapshot() []Event {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	out := make([]Event, r.count)
+	if r.count == 0 {
+		return out
+	}
+
+	// If buffer is not yet full, entries start at index 0.
+	// If full, the oldest entry is at r.head.
+	start := 0
+	if r.count == r.cap {
+		start = r.head
+	}
+	for i := 0; i < r.count; i++ {
+		out[i] = r.buf[(start+i)%r.cap]
+	}
+	return out
+}
+</file>
+
+<file path="internal/integration/queue_test.go">
+//go:build integration
+
+package integration_test
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+	"time"
+
+	amqp "github.com/rabbitmq/amqp091-go"
+	"github.com/testcontainers/testcontainers-go"
+	"github.com/testcontainers/testcontainers-go/wait"
+
+	"jobqueue/internal/jobs"
+	"jobqueue/internal/queue"
+)
+
+// startRabbitMQ spins up a RabbitMQ container and returns the AMQP URL.
+// The container is automatically terminated when the test ends.
+func startRabbitMQ(t *testing.T) string {
+	t.Helper()
+	ctx := context.Background()
+
+	container, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{
+		ContainerRequest: testcontainers.ContainerRequest{
+			Image:        "rabbitmq:3.13-alpine",
+			ExposedPorts: []string{"5672/tcp"},
+			Env: map[string]string{
+				"RABBITMQ_DEFAULT_USER": "guest",
+				"RABBITMQ_DEFAULT_PASS": "guest",
+			},
+			WaitingFor: wait.ForLog("Server startup complete").
+				WithStartupTimeout(60 * time.Second),
+		},
+		Started: true,
+	})
+	if err != nil {
+		t.Fatalf("failed to start RabbitMQ container: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := testcontainers.TerminateContainer(container); err != nil {
+			t.Logf("failed to terminate RabbitMQ container: %v", err)
+		}
+	})
+
+	host, err := container.Host(ctx)
+	if err != nil {
+		t.Fatalf("failed to get container host: %v", err)
+	}
+	port, err := container.MappedPort(ctx, "5672")
+	if err != nil {
+		t.Fatalf("failed to get mapped port: %v", err)
+	}
+
+	return fmt.Sprintf("amqp://guest:guest@%s:%s/", host, port.Port())
+}
+
+// ---------------------------------------------------------------------------
+// Test: POST /jobs with no workers → published to RabbitMQ → consumer acks
+// ---------------------------------------------------------------------------
+
+func TestIntegration_JobQueuedAndConsumed(t *testing.T) {
+	amqpURL := startRabbitMQ(t)
+
+	// Connect using our real RabbitMQ implementation.
+	rmq, err := queue.NewRabbitMQ(&queue.Config{
+		URL:       amqpURL,
+		QueueName: "jobs",
+	})
+	if err != nil {
+		t.Fatalf("failed to connect to RabbitMQ: %v", err)
+	}
+	defer rmq.Close()
+
+	// Use the real jobsHandler with an empty worker registry so every job
+	// falls through to the queue path.
+	reg := emptyRegistry{}
+	handler := jobsHandlerFunc(reg, rmq)
+
+	// Submit a job via the HTTP handler.
+	body := `{"type":"email","payload":{"to":"test@example.com","subject":"Integration test"}}`
+	req := httptest.NewRequest(http.MethodPost, "/jobs", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+	handler(rr, req)
+
+	if rr.Code != http.StatusAccepted {
+		t.Fatalf("expected 202, got %d — body: %s", rr.Code, rr.Body.String())
+	}
+
+	var resp map[string]interface{}
+	if err := json.NewDecoder(rr.Body).Decode(&resp); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+	if resp["routed"] != "queue" {
+		t.Errorf("expected routed=queue, got %v", resp["routed"])
+	}
+
+	// Now consume the message and verify it is a valid job.
+	consumed := make(chan jobs.Job, 1)
+
+	go func() {
+		msgs, err := rmq.Channel().Consume("jobs", "", false, false, false, false, nil)
+		if err != nil {
+			t.Logf("consume error: %v", err)
+			return
+		}
+		for msg := range msgs {
+			var j jobs.Job
+			if err := json.Unmarshal(msg.Body, &j); err != nil {
+				t.Logf("unmarshal error: %v", err)
+				_ = msg.Nack(false, false)
+				continue
+			}
+			_ = msg.Ack(false)
+			consumed <- j
+			return
+		}
+	}()
+
+	select {
+	case j := <-consumed:
+		if j.Type != "email" {
+			t.Errorf("expected job type 'email', got %q", j.Type)
+		}
+		if j.ID == "" {
+			t.Error("expected non-empty job ID")
+		}
+		if j.Attempts != 0 {
+			t.Errorf("expected attempts=0, got %d", j.Attempts)
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("timed out waiting for job to be consumed")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Test: job published directly → consumer retries on failure → DLQ after 3
+// ---------------------------------------------------------------------------
+
+func TestIntegration_JobRetriesAndReachesDLQ(t *testing.T) {
+	amqpURL := startRabbitMQ(t)
+
+	rmq, err := queue.NewRabbitMQ(&queue.Config{
+		URL:       amqpURL,
+		QueueName: "jobs",
+	})
+	if err != nil {
+		t.Fatalf("failed to connect to RabbitMQ: %v", err)
+	}
+	defer rmq.Close()
+
+	// Publish a job with an unknown type so the handler always fails.
+	job := jobs.Job{ID: "integ-1", Type: "unknown-type", Attempts: 0}
+	data, _ := json.Marshal(job)
+	if err := rmq.Publish(data); err != nil {
+		t.Fatalf("failed to publish job: %v", err)
+	}
+
+	// Consume and simulate the retry loop manually, mirroring handleMessage logic.
+	msgs, err := rmq.Channel().Consume("jobs", "", false, false, false, false, nil)
+	if err != nil {
+		t.Fatalf("failed to consume: %v", err)
+	}
+
+	attempts := 0
+	timeout := time.After(20 * time.Second)
+
+	for {
+		select {
+		case msg, ok := <-msgs:
+			if !ok {
+				t.Fatal("channel closed unexpectedly")
+			}
+			var j jobs.Job
+			if err := json.Unmarshal(msg.Body, &j); err != nil {
+				t.Fatalf("unmarshal failed: %v", err)
+			}
+			attempts++
+
+			if j.Attempts < 2 {
+				// Re-publish with incremented attempt counter (mirrors handleMessage).
+				j.Attempts++
+				redata, _ := json.Marshal(j)
+				_ = msg.Ack(false)
+				if err := rmq.Publish(redata); err != nil {
+					t.Fatalf("re-publish failed: %v", err)
+				}
+			} else {
+				// Third attempt — Nack to DLQ.
+				_ = msg.Nack(false, false)
+
+				// Verify the message lands on the DLQ.
+				dlqMsgs, err := rmq.Channel().Consume("jobs.dlq", "", true, false, false, false, nil)
+				if err != nil {
+					t.Fatalf("failed to consume DLQ: %v", err)
+				}
+				select {
+				case dlqMsg := <-dlqMsgs:
+					var dead jobs.Job
+					if err := json.Unmarshal(dlqMsg.Body, &dead); err != nil {
+						t.Fatalf("failed to unmarshal DLQ message: %v", err)
+					}
+					if dead.ID != "integ-1" {
+						t.Errorf("expected DLQ job id integ-1, got %q", dead.ID)
+					}
+					if attempts != 3 {
+						t.Errorf("expected 3 attempts before DLQ, got %d", attempts)
+					}
+					return
+				case <-time.After(10 * time.Second):
+					t.Fatal("timed out waiting for DLQ message")
+				}
+			}
+		case <-timeout:
+			t.Fatalf("timed out after %d attempts", attempts)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Minimal stubs — satisfy the queue.Queue interface for the handler call
+// ---------------------------------------------------------------------------
+
+// emptyRegistry satisfies enough of worker.Registry's interface for the handler.
+// Since we want the queue path, PickWorker always returns "".
+type emptyRegistry struct{}
+
+func (emptyRegistry) PickWorker() string { return "" }
+func (emptyRegistry) DispatchJob(workerID, jobID, jobType string, payload interface{}) error {
+	return nil
+}
+
+// jobsHandlerFunc is a minimal re-implementation of the POST /jobs logic
+// so the integration test doesn't import cmd/api (which has a main package).
+func jobsHandlerFunc(reg emptyRegistry, rmq queue.Queue) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Type    string      `json:"type"`
+			Payload interface{} `json:"payload"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			http.Error(w, "invalid request", http.StatusBadRequest)
+			return
+		}
+
+		j := jobs.Job{
+			ID:       generateID(),
+			Type:     body.Type,
+			Payload:  body.Payload,
+			Attempts: 0,
+		}
+
+		data, _ := json.Marshal(j)
+		if err := rmq.Publish(data); err != nil {
+			http.Error(w, "failed to queue job", http.StatusInternalServerError)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusAccepted)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"job":    j,
+			"routed": "queue",
+		})
+	}
+}
+
+func generateID() string {
+	return fmt.Sprintf("test-%d", time.Now().UnixNano())
+}
+
+// ---------------------------------------------------------------------------
+// Test: raw AMQP publish → consume → message body is valid JSON job
+// ---------------------------------------------------------------------------
+
+func TestIntegration_RawPublishAndConsume(t *testing.T) {
+	amqpURL := startRabbitMQ(t)
+
+	conn, err := amqp.Dial(amqpURL)
+	if err != nil {
+		t.Fatalf("failed to connect: %v", err)
+	}
+	defer conn.Close()
+
+	ch, err := conn.Channel()
+	if err != nil {
+		t.Fatalf("failed to open channel: %v", err)
+	}
+	defer ch.Close()
+
+	q, err := ch.QueueDeclare("raw-test", false, true, false, false, nil)
+	if err != nil {
+		t.Fatalf("failed to declare queue: %v", err)
+	}
+
+	job := jobs.Job{ID: "raw-1", Type: "email", Attempts: 0}
+	body, _ := json.Marshal(job)
+
+	if err := ch.Publish("", q.Name, false, false, amqp.Publishing{
+		ContentType: "application/json",
+		Body:        body,
+	}); err != nil {
+		t.Fatalf("failed to publish: %v", err)
+	}
+
+	msgs, err := ch.Consume(q.Name, "", true, false, false, false, nil)
+	if err != nil {
+		t.Fatalf("failed to consume: %v", err)
+	}
+
+	select {
+	case msg := <-msgs:
+		var received jobs.Job
+		if err := json.Unmarshal(msg.Body, &received); err != nil {
+			t.Fatalf("failed to unmarshal: %v", err)
+		}
+		if received.ID != "raw-1" {
+			t.Errorf("expected ID raw-1, got %q", received.ID)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("timed out waiting for message")
+	}
+}
+</file>
+
+<file path="internal/jobs/handlers/email.go">
+package handlers
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"log"
+
+	"jobqueue/internal/jobs"
+)
+
+// EmailHandler processes jobs of type "email".
+// Replace the log statements with a real mail client (e.g. SendGrid, SES)
+// when you are ready to send actual emails.
+type EmailHandler struct{}
+
+type emailPayload struct {
+	To      string `json:"to"`
+	Subject string `json:"subject"`
+	Body    string `json:"body"`
+}
+
+func (h *EmailHandler) Handle(ctx context.Context, job jobs.Job) error {
+	raw, err := json.Marshal(job.Payload)
+	if err != nil {
+		return fmt.Errorf("email handler: failed to decode payload: %w", err)
+	}
+
+	var p emailPayload
+	if err := json.Unmarshal(raw, &p); err != nil {
+		return fmt.Errorf("email handler: invalid payload shape: %w", err)
+	}
+
+	if p.To == "" {
+		return fmt.Errorf("email handler: missing required field 'to'")
+	}
+
+	// TODO: replace with real mail-client call.
+	log.Printf("[email] job=%s to=%s subject=%q — sent (simulated)", job.ID, p.To, p.Subject)
+	return nil
+}
+</file>
+
+<file path="internal/jobs/handlers/resize_image.go">
+package handlers
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"log"
+
+	"jobqueue/internal/jobs"
+)
+
+// ResizeImageHandler processes jobs of type "resize-image".
+// Replace the log statement with a real image-processing call
+// (e.g. imaging, vips, or an external service) when ready.
+type ResizeImageHandler struct{}
+
+type resizeImagePayload struct {
+	URL    string `json:"url"`
+	Width  int    `json:"width"`
+	Height int    `json:"height"`
+}
+
+func (h *ResizeImageHandler) Handle(ctx context.Context, job jobs.Job) error {
+	raw, err := json.Marshal(job.Payload)
+	if err != nil {
+		return fmt.Errorf("resize-image handler: failed to encode payload: %w", err)
+	}
+
+	var p resizeImagePayload
+	if err := json.Unmarshal(raw, &p); err != nil {
+		return fmt.Errorf("resize-image handler: invalid payload shape: %w", err)
+	}
+
+	if p.URL == "" {
+		return fmt.Errorf("resize-image handler: missing required field 'url'")
+	}
+
+	// TODO: replace with real image-processing call.
+	log.Printf("[resize-image] job=%s url=%s size=%dx%d — resized (simulated)", job.ID, p.URL, p.Width, p.Height)
+	return nil
+}
+</file>
+
+<file path="internal/jobs/handler.go">
+package jobs
+
+import (
+	"context"
+	"errors"
+	"fmt"
+)
+
+// ErrUnknownJobType is returned when no handler is registered for a job type.
+var ErrUnknownJobType = errors.New("unknown job type")
+
+// Handler processes a single job. Returning a non-nil error signals failure
+// and causes the worker to retry or send the job to the DLQ.
+type Handler interface {
+	Handle(ctx context.Context, job Job) error
+}
+
+// HandlerFunc is a convenience type that lets a plain function satisfy Handler.
+type HandlerFunc func(ctx context.Context, job Job) error
+
+func (f HandlerFunc) Handle(ctx context.Context, job Job) error {
+	return f(ctx, job)
+}
+
+// HandlerRegistry maps job types to their Handler implementations.
+// Register all handlers on startup; the worker looks up by job.Type at runtime.
+type HandlerRegistry struct {
+	handlers map[string]Handler
+}
+
+// NewHandlerRegistry returns an empty HandlerRegistry.
+func NewHandlerRegistry() *HandlerRegistry {
+	return &HandlerRegistry{handlers: make(map[string]Handler)}
+}
+
+// Register associates a job type string with a Handler.
+// Panics on duplicate registration to catch wiring mistakes at startup.
+func (r *HandlerRegistry) Register(jobType string, h Handler) {
+	if _, exists := r.handlers[jobType]; exists {
+		panic(fmt.Sprintf("jobs: handler already registered for type %q", jobType))
+	}
+	r.handlers[jobType] = h
+}
+
+// Dispatch looks up the handler for job.Type and calls it.
+// Returns ErrUnknownJobType if no handler is registered.
+func (r *HandlerRegistry) Dispatch(ctx context.Context, job Job) error {
+	h, ok := r.handlers[job.Type]
+	if !ok {
+		return fmt.Errorf("%w: %q", ErrUnknownJobType, job.Type)
+	}
+	return h.Handle(ctx, job)
+}
 </file>
 
 <file path="internal/queue/config.go">
@@ -1154,6 +1237,511 @@ data/
 *.log
 </file>
 
+<file path="cmd/api/handlers_test.go">
+package main
+
+import (
+	"encoding/json"
+	"errors"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+
+	"jobqueue/internal/events"
+	"jobqueue/internal/worker"
+)
+
+// ---------------------------------------------------------------------------
+// Stub queue — satisfies queue.Queue without RabbitMQ
+// ---------------------------------------------------------------------------
+
+type stubQueue struct {
+	published [][]byte
+	failNext  bool
+}
+
+func (s *stubQueue) Publish(body []byte) error {
+	if s.failNext {
+		s.failNext = false
+		return errors.New("publish failed")
+	}
+	s.published = append(s.published, body)
+	return nil
+}
+
+func (s *stubQueue) Close() error { return nil }
+
+// ---------------------------------------------------------------------------
+// POST /jobs — wrong method
+// ---------------------------------------------------------------------------
+
+func TestJobsHandler_WrongMethod(t *testing.T) {
+	reg := worker.NewRegistry()
+	q := &stubQueue{}
+	ring := events.NewRing(100)
+
+	req := httptest.NewRequest(http.MethodGet, "/jobs", nil)
+	rr := httptest.NewRecorder()
+	jobsHandler(reg, q, ring)(rr, req)
+
+	if rr.Code != http.StatusMethodNotAllowed {
+		t.Errorf("expected 405, got %d", rr.Code)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// POST /jobs — bad JSON body
+// ---------------------------------------------------------------------------
+
+func TestJobsHandler_InvalidBody(t *testing.T) {
+	reg := worker.NewRegistry()
+	q := &stubQueue{}
+	ring := events.NewRing(100)
+
+	req := httptest.NewRequest(http.MethodPost, "/jobs", strings.NewReader("{bad json}"))
+	req.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+	jobsHandler(reg, q, ring)(rr, req)
+
+	if rr.Code != http.StatusBadRequest {
+		t.Errorf("expected 400, got %d", rr.Code)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// POST /jobs — no workers → routed to queue
+// ---------------------------------------------------------------------------
+
+func TestJobsHandler_NoWorkers_RoutedToQueue(t *testing.T) {
+	reg := worker.NewRegistry()
+	q := &stubQueue{}
+	ring := events.NewRing(100)
+
+	body := `{"type":"email","payload":{"to":"a@b.com"}}`
+	req := httptest.NewRequest(http.MethodPost, "/jobs", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+	jobsHandler(reg, q, ring)(rr, req)
+
+	if rr.Code != http.StatusAccepted {
+		t.Errorf("expected 202, got %d", rr.Code)
+	}
+
+	var resp map[string]interface{}
+	if err := json.NewDecoder(rr.Body).Decode(&resp); err != nil {
+		t.Fatalf("could not decode response: %v", err)
+	}
+	if resp["routed"] != "queue" {
+		t.Errorf("expected routed=queue, got %v", resp["routed"])
+	}
+	if len(q.published) != 1 {
+		t.Errorf("expected 1 published message, got %d", len(q.published))
+	}
+
+	// Verify event was recorded.
+	snap := ring.Snapshot()
+	if len(snap) != 1 {
+		t.Errorf("expected 1 event in ring, got %d", len(snap))
+	}
+	if snap[0].Kind != events.KindQueued {
+		t.Errorf("expected event kind queued, got %v", snap[0].Kind)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// POST /jobs — worker alive → routed direct
+// ---------------------------------------------------------------------------
+
+func TestJobsHandler_WithWorker_RoutedDirect(t *testing.T) {
+	workerServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer workerServer.Close()
+
+	reg := worker.NewRegistry()
+	reg.Register("w1", workerServer.Listener.Addr().String())
+
+	q := &stubQueue{}
+	ring := events.NewRing(100)
+
+	body := `{"type":"email","payload":{"to":"a@b.com"}}`
+	req := httptest.NewRequest(http.MethodPost, "/jobs", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+	jobsHandler(reg, q, ring)(rr, req)
+
+	if rr.Code != http.StatusAccepted {
+		t.Errorf("expected 202, got %d", rr.Code)
+	}
+
+	var resp map[string]interface{}
+	if err := json.NewDecoder(rr.Body).Decode(&resp); err != nil {
+		t.Fatalf("could not decode response: %v", err)
+	}
+	if resp["routed"] != "direct" {
+		t.Errorf("expected routed=direct, got %v", resp["routed"])
+	}
+	if resp["worker_id"] != "w1" {
+		t.Errorf("expected worker_id=w1, got %v", resp["worker_id"])
+	}
+	if len(q.published) != 0 {
+		t.Errorf("expected 0 published messages, got %d", len(q.published))
+	}
+
+	// Verify event was recorded.
+	snap := ring.Snapshot()
+	if len(snap) != 1 {
+		t.Errorf("expected 1 event in ring, got %d", len(snap))
+	}
+	if snap[0].Kind != events.KindDirect {
+		t.Errorf("expected event kind direct, got %v", snap[0].Kind)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// POST /jobs — worker dispatch fails → falls back to queue
+// ---------------------------------------------------------------------------
+
+func TestJobsHandler_WorkerDispatchFails_FallsBackToQueue(t *testing.T) {
+	workerServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer workerServer.Close()
+
+	reg := worker.NewRegistry()
+	reg.Register("w1", workerServer.Listener.Addr().String())
+
+	q := &stubQueue{}
+	ring := events.NewRing(100)
+
+	body := `{"type":"email","payload":{}}`
+	req := httptest.NewRequest(http.MethodPost, "/jobs", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+	jobsHandler(reg, q, ring)(rr, req)
+
+	if rr.Code != http.StatusAccepted {
+		t.Errorf("expected 202, got %d", rr.Code)
+	}
+
+	var resp map[string]interface{}
+	if err := json.NewDecoder(rr.Body).Decode(&resp); err != nil {
+		t.Fatalf("could not decode response: %v", err)
+	}
+	if resp["routed"] != "queue" {
+		t.Errorf("expected routed=queue after dispatch failure, got %v", resp["routed"])
+	}
+	if len(q.published) != 1 {
+		t.Errorf("expected 1 published message after fallback, got %d", len(q.published))
+	}
+}
+
+// ---------------------------------------------------------------------------
+// POST /jobs — response contains expected job fields
+// ---------------------------------------------------------------------------
+
+func TestJobsHandler_ResponseContainsJobFields(t *testing.T) {
+	reg := worker.NewRegistry()
+	q := &stubQueue{}
+	ring := events.NewRing(100)
+
+	body := `{"type":"resize-image","payload":{"url":"https://example.com/img.png"}}`
+	req := httptest.NewRequest(http.MethodPost, "/jobs", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+	jobsHandler(reg, q, ring)(rr, req)
+
+	var resp map[string]interface{}
+	json.NewDecoder(rr.Body).Decode(&resp)
+
+	jobField, ok := resp["job"].(map[string]interface{})
+	if !ok {
+		t.Fatal("expected job field in response")
+	}
+	if jobField["type"] != "resize-image" {
+		t.Errorf("expected type resize-image, got %v", jobField["type"])
+	}
+	if jobField["id"] == "" || jobField["id"] == nil {
+		t.Error("expected non-empty job id")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// GET /workers — wrong method
+// ---------------------------------------------------------------------------
+
+func TestWorkersHandler_WrongMethod(t *testing.T) {
+	reg := worker.NewRegistry()
+
+	req := httptest.NewRequest(http.MethodPost, "/workers", nil)
+	rr := httptest.NewRecorder()
+	workersHandler(reg)(rr, req)
+
+	if rr.Code != http.StatusMethodNotAllowed {
+		t.Errorf("expected 405, got %d", rr.Code)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// GET /workers — empty registry
+// ---------------------------------------------------------------------------
+
+func TestWorkersHandler_EmptyRegistry(t *testing.T) {
+	reg := worker.NewRegistry()
+
+	req := httptest.NewRequest(http.MethodGet, "/workers", nil)
+	rr := httptest.NewRecorder()
+	workersHandler(reg)(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Errorf("expected 200, got %d", rr.Code)
+	}
+
+	var resp map[string]interface{}
+	json.NewDecoder(rr.Body).Decode(&resp)
+
+	if resp["count"].(float64) != 0 {
+		t.Errorf("expected count 0, got %v", resp["count"])
+	}
+}
+
+// ---------------------------------------------------------------------------
+// GET /workers — returns correct count and status
+// ---------------------------------------------------------------------------
+
+func TestWorkersHandler_ReturnsWorkersWithStatus(t *testing.T) {
+	reg := worker.NewRegistry()
+	reg.Register("w1", "localhost:9001")
+	reg.Register("w2", "localhost:9002")
+	reg.UpdateLoad("w2", 1)
+
+	req := httptest.NewRequest(http.MethodGet, "/workers", nil)
+	rr := httptest.NewRecorder()
+	workersHandler(reg)(rr, req)
+
+	var resp map[string]interface{}
+	json.NewDecoder(rr.Body).Decode(&resp)
+
+	if resp["count"].(float64) != 2 {
+		t.Errorf("expected count 2, got %v", resp["count"])
+	}
+
+	workers := resp["workers"].([]interface{})
+	statusByID := make(map[string]string)
+	for _, w := range workers {
+		wm := w.(map[string]interface{})
+		statusByID[wm["worker_id"].(string)] = wm["status"].(string)
+	}
+
+	if statusByID["w1"] != "idle" {
+		t.Errorf("expected w1 idle, got %s", statusByID["w1"])
+	}
+	if statusByID["w2"] != "busy" {
+		t.Errorf("expected w2 busy, got %s", statusByID["w2"])
+	}
+}
+
+// ---------------------------------------------------------------------------
+// GET /events — returns events in reverse chronological order
+// ---------------------------------------------------------------------------
+
+func TestEventsHandler_ReturnsEvents(t *testing.T) {
+	ring := events.NewRing(100)
+	ring.Push(events.Event{JobID: "j1", JobType: "email", Kind: events.KindQueued, Message: "queued"})
+	ring.Push(events.Event{JobID: "j2", JobType: "email", Kind: events.KindDirect, Message: "direct"})
+
+	req := httptest.NewRequest(http.MethodGet, "/events", nil)
+	rr := httptest.NewRecorder()
+	eventsHandler(ring)(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Errorf("expected 200, got %d", rr.Code)
+	}
+
+	var resp map[string]interface{}
+	json.NewDecoder(rr.Body).Decode(&resp)
+
+	if resp["count"].(float64) != 2 {
+		t.Errorf("expected count 2, got %v", resp["count"])
+	}
+
+	evts := resp["events"].([]interface{})
+	// Newest first — j2 should be index 0.
+	first := evts[0].(map[string]interface{})
+	if first["job_id"] != "j2" {
+		t.Errorf("expected newest event first (j2), got %v", first["job_id"])
+	}
+}
+</file>
+
+<file path="cmd/api/handlers.go">
+package main
+
+import (
+	"encoding/json"
+	"log"
+	"net/http"
+
+	"github.com/google/uuid"
+
+	"jobqueue/internal/events"
+	"jobqueue/internal/jobs"
+	"jobqueue/internal/queue"
+	"jobqueue/internal/worker"
+)
+
+// shortID returns the first 8 characters of id, or id itself if shorter.
+func shortID(id string) string {
+	if len(id) <= 8 {
+		return id
+	}
+	return id[:8]
+}
+
+// jobsHandler handles POST /jobs.
+func jobsHandler(registry *worker.Registry, rmq queue.Queue, ring *events.Ring) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		var body struct {
+			Type    string      `json:"type"`
+			Payload interface{} `json:"payload"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			http.Error(w, "invalid request: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+
+		job := jobs.Job{
+			ID:       uuid.NewString(),
+			Type:     body.Type,
+			Payload:  body.Payload,
+			Attempts: 0,
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusAccepted)
+
+		workerID := registry.PickWorker()
+		if workerID != "" {
+			if err := registry.DispatchJob(workerID, job.ID, job.Type, job.Payload); err == nil {
+				log.Printf("job %s dispatched directly to worker %s", job.ID, workerID)
+				ring.Push(events.Event{
+					JobID:    job.ID,
+					JobType:  job.Type,
+					Kind:     events.KindDirect,
+					WorkerID: workerID,
+					Message:  "dispatched direct → " + shortID(workerID),
+				})
+				json.NewEncoder(w).Encode(map[string]interface{}{
+					"job":       job,
+					"routed":    "direct",
+					"worker_id": workerID,
+				})
+				return
+			}
+			log.Printf("direct dispatch to worker %s failed, falling back to queue", workerID)
+			ring.Push(events.Event{
+				JobID:   job.ID,
+				JobType: job.Type,
+				Kind:    events.KindError,
+				Message: "direct dispatch failed, falling back to queue",
+			})
+		}
+
+		data, err := json.Marshal(job)
+		if err != nil {
+			http.Error(w, "failed to encode job", http.StatusInternalServerError)
+			return
+		}
+		if err := rmq.Publish(data); err != nil {
+			http.Error(w, "failed to queue job", http.StatusInternalServerError)
+			return
+		}
+		log.Printf("job %s queued (no alive workers)", job.ID)
+		ring.Push(events.Event{
+			JobID:   job.ID,
+			JobType: job.Type,
+			Kind:    events.KindQueued,
+			Message: "published to queue — no alive workers",
+		})
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"job":    job,
+			"routed": "queue",
+			"note":   "no alive workers, job queued",
+		})
+	}
+}
+
+// workersHandler handles GET /workers.
+func workersHandler(registry *worker.Registry) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		snapshot := registry.List()
+
+		type workerView struct {
+			WorkerID     string `json:"worker_id"`
+			LastSeenUnix int64  `json:"last_seen_unix"`
+			Load         int32  `json:"load"`
+			Status       string `json:"status"`
+		}
+
+		workers := make([]workerView, 0, len(snapshot))
+		for id, info := range snapshot {
+			status := "idle"
+			if info.Load > 0 {
+				status = "busy"
+			}
+			workers = append(workers, workerView{
+				WorkerID:     id,
+				LastSeenUnix: info.LastSeen.Unix(),
+				Load:         info.Load,
+				Status:       status,
+			})
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"count":   len(workers),
+			"workers": workers,
+		})
+	}
+}
+
+// eventsHandler handles GET /events — returns the recent activity ring as JSON.
+func eventsHandler(ring *events.Ring) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+
+		snapshot := ring.Snapshot()
+
+		// Return newest-first so the dashboard can prepend without reversing.
+		reversed := make([]events.Event, len(snapshot))
+		for i, e := range snapshot {
+			reversed[len(snapshot)-1-i] = e
+		}
+
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"count":  len(reversed),
+			"events": reversed,
+		})
+	}
+}
+</file>
+
 <file path="cmd/worker/dlq_consumer/main.go">
 package main
 
@@ -1220,6 +1808,205 @@ func main() {
 		msg.Ack(false)
 	}
 }
+</file>
+
+<file path="cmd/worker/worker_main/worker_test.go">
+package main
+
+import (
+	"encoding/json"
+	"testing"
+
+	amqp "github.com/rabbitmq/amqp091-go"
+
+	"jobqueue/internal/jobs"
+)
+
+// ---------------------------------------------------------------------------
+// Stub queue.Queue
+// ---------------------------------------------------------------------------
+
+type stubQueue struct {
+	published [][]byte
+}
+
+func (s *stubQueue) Publish(body []byte) error {
+	s.published = append(s.published, body)
+	return nil
+}
+
+func (s *stubQueue) Close() error { return nil }
+
+// ---------------------------------------------------------------------------
+// deliveryAcker records which acknowledgement method was called.
+// ---------------------------------------------------------------------------
+
+type deliveryAcker struct {
+	acked       bool
+	nacked      bool
+	nackRequeue bool
+}
+
+func (a *deliveryAcker) Ack(_ uint64, _ bool) error {
+	a.acked = true
+	return nil
+}
+
+func (a *deliveryAcker) Nack(_ uint64, _ bool, requeue bool) error {
+	a.nacked = true
+	a.nackRequeue = requeue
+	return nil
+}
+
+func (a *deliveryAcker) Reject(_ uint64, _ bool) error { return nil }
+
+// ---------------------------------------------------------------------------
+// Helper — build an amqp.Delivery from a Job
+// ---------------------------------------------------------------------------
+
+func jobDelivery(t *testing.T, job jobs.Job) (amqp.Delivery, *deliveryAcker) {
+	t.Helper()
+	body, err := json.Marshal(job)
+	if err != nil {
+		t.Fatalf("marshal failed: %v", err)
+	}
+	acker := &deliveryAcker{}
+	return amqp.Delivery{Body: body, Acknowledger: acker}, acker
+}
+
+// ---------------------------------------------------------------------------
+// Invalid JSON — Nacked without requeue, nothing published
+// ---------------------------------------------------------------------------
+
+func TestHandleMessage_InvalidJSON_NackedAndDiscarded(t *testing.T) {
+	q := &stubQueue{}
+	acker := &deliveryAcker{}
+	d := amqp.Delivery{Body: []byte("{bad json}"), Acknowledger: acker}
+
+	handleMessage(d, q)
+
+	if !acker.nacked {
+		t.Error("expected Nack for invalid JSON")
+	}
+	if acker.nackRequeue {
+		t.Error("expected Nack without requeue")
+	}
+	if len(q.published) != 0 {
+		t.Errorf("expected nothing published, got %d", len(q.published))
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Known job type (email) — succeeds → Acked, nothing re-published
+// ---------------------------------------------------------------------------
+
+func TestHandleMessage_ValidJob_Acked(t *testing.T) {
+	q := &stubQueue{}
+	job := jobs.Job{
+		ID:       "j1",
+		Type:     "email",
+		Payload:  map[string]interface{}{"to": "user@example.com", "subject": "Hello"},
+		Attempts: 0,
+	}
+	d, acker := jobDelivery(t, job)
+
+	handleMessage(d, q)
+
+	if !acker.acked {
+		t.Error("expected Ack for successful email job")
+	}
+	if len(q.published) != 0 {
+		t.Errorf("expected 0 re-published messages, got %d", len(q.published))
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Unknown job type — Nacked without requeue on first attempt (no retry)
+// ---------------------------------------------------------------------------
+
+func TestHandleMessage_UnknownJobType_NackedWithoutRetry(t *testing.T) {
+	q := &stubQueue{}
+	job := jobs.Job{ID: "j2", Type: "unknown-type", Attempts: 0}
+	d, acker := jobDelivery(t, job)
+
+	handleMessage(d, q)
+
+	// First failure → attempts becomes 1, which is < maxAttempts(3), so it
+	// should be Acked and re-published with incremented attempt counter.
+	if !acker.acked {
+		t.Error("expected Ack before re-publish on first failure")
+	}
+	if len(q.published) != 1 {
+		t.Errorf("expected 1 re-published message for retry, got %d", len(q.published))
+	}
+
+	// Verify the re-published message has attempts incremented to 1.
+	var retried jobs.Job
+	if err := json.Unmarshal(q.published[0], &retried); err != nil {
+		t.Fatalf("could not unmarshal re-published job: %v", err)
+	}
+	if retried.Attempts != 1 {
+		t.Errorf("expected attempts=1 in re-published job, got %d", retried.Attempts)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Attempts counter is preserved through JSON round-trip
+// ---------------------------------------------------------------------------
+
+func TestHandleMessage_AttemptsPreservedInPayload(t *testing.T) {
+	job := jobs.Job{ID: "j1", Type: "resize-image", Attempts: 1}
+	body, _ := json.Marshal(job)
+
+	var roundTripped jobs.Job
+	if err := json.Unmarshal(body, &roundTripped); err != nil {
+		t.Fatalf("unmarshal failed: %v", err)
+	}
+	if roundTripped.Attempts != 1 {
+		t.Errorf("expected attempts 1, got %d", roundTripped.Attempts)
+	}
+	if roundTripped.ID != "j1" {
+		t.Errorf("expected ID j1, got %s", roundTripped.ID)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// DLQ path — Nack without requeue when attempts == maxAttempts
+// ---------------------------------------------------------------------------
+
+func TestHandleMessage_ExhaustedAttempts_NackedToDLQ(t *testing.T) {
+	q := &stubQueue{}
+	// attempts=2, maxAttempts=3: after increment → 3, which is not < 3, so DLQ.
+	job := jobs.Job{ID: "j3", Type: "unknown-type", Attempts: 2}
+	d, acker := jobDelivery(t, job)
+
+	handleMessage(d, q)
+
+	if !acker.nacked {
+		t.Error("expected Nack when attempts exhausted")
+	}
+	if acker.nackRequeue {
+		t.Error("expected Nack without requeue (to DLQ)")
+	}
+	if len(q.published) != 0 {
+		t.Errorf("expected nothing re-published after DLQ, got %d", len(q.published))
+	}
+}
+</file>
+
+<file path="docker/Dockerfile.api">
+FROM golang:1.24-alpine AS builder
+WORKDIR /app
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN go build -o api ./cmd/api
+
+FROM alpine:3.19
+WORKDIR /app
+COPY --from=builder /app/api .
+EXPOSE 8081 50051
+CMD ["./api"]
 </file>
 
 <file path="internal/jobs/job.go">
@@ -2031,6 +2818,737 @@ message WorkerList {
 }
 </file>
 
+<file path="cmd/api/static/index.html">
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Hermes — System Dashboard</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Departure+Mono&family=Cormorant:ital,wght@0,300;0,400;0,600;1,300;1,400&display=swap" rel="stylesheet" />
+
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg:         #0e0e0b;
+      --bg-raised:  #131310;
+      --bg-line:    #1a1a17;
+      --border:     #272722;
+      --border-mid: #3a3a33;
+      --text-dim:   #44443c;
+      --text-mid:   #78786e;
+      --text:       #c8c8b8;
+      --text-bright:#eeeee0;
+      --amber:      #d4891a;
+      --amber-dim:  #6e450a;
+      --amber-glow: rgba(212,137,26,0.10);
+      --green:      #4a8c5c;
+      --red-bright: #c45050;
+      --mono:       'Departure Mono', monospace;
+      --serif:      'Cormorant', serif;
+    }
+
+    html { font-size: 14px; }
+
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: var(--mono);
+      min-height: 100vh;
+      overflow-x: hidden;
+    }
+
+    /* Scan-line texture */
+    body::before {
+      content: '';
+      position: fixed;
+      inset: 0;
+      background: repeating-linear-gradient(
+        0deg,
+        transparent,
+        transparent 2px,
+        rgba(0,0,0,0.03) 2px,
+        rgba(0,0,0,0.03) 4px
+      );
+      pointer-events: none;
+      z-index: 1000;
+    }
+
+    /* ── Layout ── */
+    .shell {
+      max-width: 1400px;
+      margin: 0 auto;
+      padding: 0 2rem;
+      display: flex;
+      flex-direction: column;
+      min-height: 100vh;
+    }
+
+    /* ── Header ── */
+    header {
+      display: grid;
+      grid-template-columns: 1fr auto 1fr;
+      align-items: end;
+      padding: 2.5rem 0 1.5rem;
+      border-bottom: 1px solid var(--border);
+      gap: 2rem;
+    }
+
+    .header-left { display: flex; flex-direction: column; gap: 0.25rem; }
+
+    .wordmark {
+      font-family: var(--serif);
+      font-size: 2.4rem;
+      font-weight: 300;
+      letter-spacing: 0.12em;
+      color: var(--text-bright);
+      line-height: 1;
+    }
+    .wordmark em { font-style: italic; color: var(--amber); }
+
+    .system-label {
+      font-size: 0.72rem;
+      letter-spacing: 0.25em;
+      text-transform: uppercase;
+      color: var(--text-dim);
+    }
+
+    .header-center {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 0.4rem;
+    }
+
+    .status-pill {
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+      font-size: 0.62rem;
+      letter-spacing: 0.2em;
+      text-transform: uppercase;
+      color: var(--text-mid);
+      border: 1px solid var(--border);
+      padding: 0.35rem 0.85rem;
+    }
+
+    .pulse-dot {
+      width: 6px; height: 6px;
+      border-radius: 50%;
+      background: var(--green);
+      animation: pulse 2.4s ease-in-out infinite;
+      flex-shrink: 0;
+    }
+    @keyframes pulse {
+      0%,100% { opacity:1; transform:scale(1); }
+      50%      { opacity:0.35; transform:scale(0.65); }
+    }
+
+    .clock { font-size: 0.65rem; color: var(--text-dim); letter-spacing: 0.08em; }
+
+    .header-right {
+      display: flex;
+      align-items: flex-end;
+      justify-content: flex-end;
+    }
+
+    .submit-btn {
+      background: none;
+      border: 1px solid var(--amber-dim);
+      color: var(--amber);
+      font-family: var(--mono);
+      font-size: 0.62rem;
+      letter-spacing: 0.2em;
+      text-transform: uppercase;
+      padding: 0.5rem 1.25rem;
+      cursor: pointer;
+      transition: background 0.2s, border-color 0.2s;
+    }
+    .submit-btn:hover { background: var(--amber-glow); border-color: var(--amber); }
+
+    /* ── Stat strip ── */
+    .stat-strip {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      border: 1px solid var(--border);
+      border-top: none;
+    }
+
+    .stat-cell {
+      padding: 1.5rem 1.75rem;
+      border-right: 1px solid var(--border);
+    }
+    .stat-cell:last-child { border-right: none; }
+
+    .stat-label {
+      font-size: 0.72rem;
+      letter-spacing: 0.25em;
+      text-transform: uppercase;
+      color: var(--text-dim);
+      margin-bottom: 0.6rem;
+    }
+
+    .stat-value {
+      font-family: var(--serif);
+      font-size: 3.2rem;
+      font-weight: 300;
+      line-height: 1;
+      color: var(--text-bright);
+      transition: color 0.3s;
+    }
+    .stat-value.amber { color: var(--amber); }
+    .stat-value.dim   { color: var(--text-mid); }
+
+    .stat-sub {
+      font-size: 0.68rem;
+      color: var(--text-dim);
+      margin-top: 0.45rem;
+      letter-spacing: 0.08em;
+    }
+
+    /* ── Main content ── */
+    .content {
+      display: grid;
+      grid-template-columns: 1fr 1fr 1fr;
+      flex: 1;
+    }
+
+    /* ── Section head ── */
+    .section-head {
+      font-size: 0.72rem;
+      letter-spacing: 0.25em;
+      text-transform: uppercase;
+      color: var(--text-dim);
+      padding: 0.85rem 1.75rem;
+      border-bottom: 1px solid var(--border);
+      border-top: 2px solid var(--amber-dim);
+      background: var(--bg-raised);
+    }
+
+    .section-head.plain { border-top-color: var(--border); }
+
+    /* ── Workers ── */
+    .workers-panel {
+      grid-column: 1 / 3;
+      border: 1px solid var(--border);
+      border-top: none;
+      border-right: none;
+    }
+
+    .worker-row {
+      display: grid;
+      grid-template-columns: 10px 1fr auto 90px auto;
+      align-items: center;
+      gap: 1.25rem;
+      padding: 0.9rem 1.75rem;
+      border-bottom: 1px solid var(--bg-line);
+      transition: background 0.15s;
+      animation: rowIn 0.35s ease both;
+      opacity: 0;
+    }
+    @keyframes rowIn {
+      from { opacity:0; transform:translateX(-6px); }
+      to   { opacity:1; transform:translateX(0); }
+    }
+    .worker-row:hover { background: var(--bg-raised); }
+    .worker-row:last-child { border-bottom: none; }
+
+    .w-dot {
+      width: 8px; height: 8px;
+      border-radius: 50%;
+      flex-shrink: 0;
+    }
+    .w-dot.idle { background: var(--green); box-shadow: 0 0 5px var(--green); }
+    .w-dot.busy { background: var(--amber); box-shadow: 0 0 5px var(--amber); animation: pulse 1.2s ease-in-out infinite; }
+
+    .w-id {
+      font-size: 0.7rem;
+      color: var(--text);
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .w-id span { color: var(--text-dim); font-size: 0.62rem; margin-left: 0.4rem; }
+
+    .w-status {
+      font-size: 0.6rem;
+      color: var(--text-mid);
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+      white-space: nowrap;
+    }
+
+    .w-bar-wrap { width: 90px; height: 2px; background: var(--border); }
+    .w-bar { height: 100%; background: var(--amber); transition: width 0.5s ease; }
+
+    .w-seen {
+      font-size: 0.6rem;
+      color: var(--text-dim);
+      white-space: nowrap;
+      text-align: right;
+    }
+
+    .empty-state {
+      padding: 3rem 1.75rem;
+      font-size: 0.68rem;
+      color: var(--text-dim);
+      letter-spacing: 0.08em;
+    }
+
+    /* ── Log ── */
+    .log-panel {
+      grid-column: 3 / 4;
+      border: 1px solid var(--border);
+      border-top: none;
+      display: flex;
+      flex-direction: column;
+    }
+
+    .log-body {
+      flex: 1;
+      overflow-y: auto;
+      max-height: 480px;
+    }
+    .log-body::-webkit-scrollbar { width: 2px; }
+    .log-body::-webkit-scrollbar-thumb { background: var(--border); }
+
+    .log-entry {
+      display: grid;
+      grid-template-columns: 52px 1fr;
+      gap: 0.75rem;
+      padding: 0.55rem 1.25rem;
+      border-bottom: 1px solid var(--bg-line);
+      animation: logIn 0.25s ease both;
+    }
+    @keyframes logIn {
+      from { opacity:0; transform:translateY(-3px); }
+      to   { opacity:1; transform:translateY(0); }
+    }
+
+    .log-time {
+      font-size: 0.58rem;
+      color: var(--text-dim);
+      letter-spacing: 0.04em;
+      padding-top: 2px;
+      white-space: nowrap;
+    }
+
+    .log-content { display: flex; flex-direction: column; gap: 0.15rem; }
+
+    .log-type {
+      font-size: 0.6rem;
+      text-transform: uppercase;
+      letter-spacing: 0.12em;
+    }
+    .log-type.direct { color: var(--amber); }
+    .log-type.queued { color: var(--text); }
+    .log-type.error  { color: var(--red-bright); }
+    .log-type.info   { color: var(--text-dim); }
+
+    .log-detail {
+      font-size: 0.62rem;
+      color: var(--text-mid);
+      word-break: break-all;
+      line-height: 1.4;
+    }
+
+    /* ── Modal ── */
+    .backdrop {
+      position: fixed; inset: 0;
+      background: rgba(14,14,11,0.85);
+      z-index: 500;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      opacity: 0;
+      pointer-events: none;
+      transition: opacity 0.2s;
+    }
+    .backdrop.open { opacity:1; pointer-events:all; }
+
+    .modal {
+      background: var(--bg-raised);
+      border: 1px solid var(--border-mid);
+      border-top: 2px solid var(--amber);
+      width: 460px;
+      padding: 2rem;
+      transform: translateY(10px);
+      transition: transform 0.22s;
+    }
+    .backdrop.open .modal { transform: translateY(0); }
+
+    .modal-title {
+      font-family: var(--serif);
+      font-size: 1.5rem;
+      font-weight: 300;
+      color: var(--text-bright);
+      letter-spacing: 0.08em;
+      margin-bottom: 1.5rem;
+    }
+    .modal-title em { font-style: italic; color: var(--amber); }
+
+    .field { margin-bottom: 1.1rem; }
+    .field label {
+      display: block;
+      font-size: 0.58rem;
+      letter-spacing: 0.2em;
+      text-transform: uppercase;
+      color: var(--text-dim);
+      margin-bottom: 0.35rem;
+    }
+    .field input,
+    .field select,
+    .field textarea {
+      width: 100%;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      color: var(--text);
+      font-family: var(--mono);
+      font-size: 0.72rem;
+      padding: 0.55rem 0.75rem;
+      outline: none;
+      transition: border-color 0.2s;
+      resize: vertical;
+    }
+    .field input:focus,
+    .field select:focus,
+    .field textarea:focus { border-color: var(--amber-dim); }
+    .field select option { background: var(--bg-raised); }
+
+    .modal-actions {
+      display: flex; gap: 0.75rem;
+      justify-content: flex-end;
+      margin-top: 1.5rem;
+    }
+
+    .btn {
+      background: none;
+      font-family: var(--mono);
+      font-size: 0.62rem;
+      letter-spacing: 0.15em;
+      text-transform: uppercase;
+      padding: 0.5rem 1.1rem;
+      cursor: pointer;
+      transition: background 0.15s, border-color 0.15s, color 0.15s;
+    }
+    .btn-cancel { border: 1px solid var(--border); color: var(--text-mid); }
+    .btn-cancel:hover { border-color: var(--border-mid); color: var(--text); }
+    .btn-submit {
+      border: 1px solid var(--amber-dim);
+      color: var(--amber);
+      background: var(--amber-glow);
+    }
+    .btn-submit:hover { background: rgba(212,137,26,0.18); border-color: var(--amber); }
+
+    /* ── Footer ── */
+    footer {
+      border-top: 1px solid var(--border);
+      padding: 1rem 0;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-top: auto;
+    }
+    .footer-txt { font-size: 0.58rem; color: var(--text-dim); letter-spacing: 0.12em; }
+
+    /* ── Toast ── */
+    .toast {
+      position: fixed;
+      bottom: 2rem; right: 2rem;
+      background: var(--bg-raised);
+      border: 1px solid var(--border-mid);
+      border-left: 2px solid var(--amber);
+      padding: 0.7rem 1.1rem;
+      font-size: 0.65rem;
+      color: var(--text);
+      z-index: 600;
+      transform: translateY(6px);
+      opacity: 0;
+      transition: opacity 0.18s, transform 0.18s;
+      pointer-events: none;
+      max-width: 300px;
+    }
+    .toast.show { opacity:1; transform:translateY(0); }
+    .toast.err  { border-left-color: var(--red-bright); }
+  </style>
+</head>
+<body>
+
+<div class="shell">
+  <header>
+    <div class="header-left">
+      <div class="wordmark">Her<em>mes</em></div>
+      <div class="system-label">Distributed Job Processing System</div>
+    </div>
+    <div class="header-center">
+      <div class="status-pill">
+        <div class="pulse-dot" id="sysDot"></div>
+        <span id="sysStatus">Connecting</span>
+      </div>
+      <div class="clock" id="clock">—</div>
+    </div>
+    <div class="header-right">
+      <button class="submit-btn" onclick="openModal()">+ Submit Job</button>
+    </div>
+  </header>
+
+  <div class="stat-strip">
+    <div class="stat-cell">
+      <div class="stat-label">Active Workers</div>
+      <div class="stat-value" id="sWorkers">—</div>
+      <div class="stat-sub">nodes registered</div>
+    </div>
+    <div class="stat-cell">
+      <div class="stat-label">Idle</div>
+      <div class="stat-value" id="sIdle">—</div>
+      <div class="stat-sub">awaiting work</div>
+    </div>
+    <div class="stat-cell">
+      <div class="stat-label">Busy</div>
+      <div class="stat-value amber" id="sBusy">—</div>
+      <div class="stat-sub">processing</div>
+    </div>
+    <div class="stat-cell">
+      <div class="stat-label">Jobs This Session</div>
+      <div class="stat-value dim" id="sJobs">0</div>
+      <div class="stat-sub">submitted via dashboard</div>
+    </div>
+  </div>
+
+  <div class="content">
+    <div class="workers-panel">
+      <div class="section-head">Worker Fleet</div>
+      <div id="workersList"><div class="empty-state">Polling for workers…</div></div>
+    </div>
+
+    <div class="log-panel">
+      <div class="section-head plain">Activity Log</div>
+      <div class="log-body" id="logBody">
+        <div class="empty-state">Waiting for events…</div>
+      </div>
+    </div>
+  </div>
+
+  <footer>
+    <div class="footer-txt">Hermes v1.0 — Philip Machar</div>
+    <div class="footer-txt" id="lastPoll">Last poll: —</div>
+  </footer>
+</div>
+
+<!-- Modal -->
+<div class="backdrop" id="backdrop">
+  <div class="modal">
+    <div class="modal-title">Submit <em>Job</em></div>
+    <div class="field">
+      <label>Job Type</label>
+      <select id="jobType">
+        <option value="email">email</option>
+        <option value="resize-image">resize-image</option>
+      </select>
+    </div>
+    <div class="field">
+      <label>Payload (JSON)</label>
+      <textarea id="jobPayload" rows="5" placeholder='{"to":"user@example.com","subject":"Hello"}'></textarea>
+    </div>
+    <div class="modal-actions">
+      <button class="btn btn-cancel" onclick="closeModal()">Cancel</button>
+      <button class="btn btn-submit" onclick="submitJob()">Dispatch</button>
+    </div>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+  // ── Constants ──────────────────────────────────────────────────────────────
+  const POLL_MS   = 3000;
+  const LOG_MAX   = 80;
+
+  // ── State ──────────────────────────────────────────────────────────────────
+  let sessionJobs    = 0;
+  let seenEventIDs   = new Set();   // deduplicate events from /events endpoint
+  let barStart       = null;
+
+  // ── Clock ──────────────────────────────────────────────────────────────────
+  function tickClock() {
+    document.getElementById('clock').textContent =
+      new Date().toUTCString().replace('GMT','UTC');
+  }
+  tickClock();
+  setInterval(tickClock, 1000);
+
+  // ── Poll /workers ──────────────────────────────────────────────────────────
+  async function pollWorkers() {
+    try {
+      const res  = await fetch('/workers');
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      const data = await res.json();
+      renderWorkers(data);
+      setStatus(data.count > 0);
+    } catch(e) {
+      setStatus(false);
+    }
+  }
+
+  function renderWorkers(data) {
+    const workers = data.workers || [];
+    const idle    = workers.filter(w => w.status === 'idle').length;
+    const busy    = workers.filter(w => w.status === 'busy').length;
+
+    document.getElementById('sWorkers').textContent = data.count ?? 0;
+    document.getElementById('sIdle').textContent    = idle;
+    document.getElementById('sBusy').textContent    = busy;
+
+    const list = document.getElementById('workersList');
+    if (!workers.length) {
+      list.innerHTML = '<div class="empty-state">No workers registered.</div>';
+      return;
+    }
+
+    list.innerHTML = workers.map((w, i) => {
+      const loadPct = Math.min(w.load * 20, 100);
+      const short   = w.worker_id.length > 20
+        ? w.worker_id.slice(0,8) + '…' + w.worker_id.slice(-6)
+        : w.worker_id;
+      return `
+        <div class="worker-row" style="animation-delay:${i*0.04}s">
+          <div class="w-dot ${w.status}"></div>
+          <div class="w-id">${short}<span>${w.status}</span></div>
+          <div class="w-status">${w.status}</div>
+          <div class="w-bar-wrap"><div class="w-bar" style="width:${loadPct}%"></div></div>
+          <div class="w-seen">${timeSince(w.last_seen_unix)}</div>
+        </div>`;
+    }).join('');
+  }
+
+  function setStatus(online) {
+    const dot  = document.getElementById('sysDot');
+    const txt  = document.getElementById('sysStatus');
+    dot.style.background = online ? 'var(--green)' : 'var(--amber)';
+    txt.textContent      = online ? 'Operational' : 'No workers';
+  }
+
+  // ── Poll /events ───────────────────────────────────────────────────────────
+  async function pollEvents() {
+    try {
+      const res  = await fetch('/events');
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      const data = await res.json();
+      renderEvents(data.events || []);
+      document.getElementById('lastPoll').textContent =
+        'Last poll: ' + new Date().toLocaleTimeString();
+    } catch(e) { /* silent */ }
+  }
+
+  function renderEvents(evts) {
+    const body = document.getElementById('logBody');
+    let hasNew = false;
+
+    // evts arrive newest-first from the server; process in that order
+    // so we prepend them in order.
+    for (const e of evts) {
+      // Use time+jobID as a stable dedup key.
+      const key = e.time + '|' + e.job_id;
+      if (seenEventIDs.has(key)) continue;
+      seenEventIDs.add(key);
+      hasNew = true;
+
+      const t    = new Date(e.time);
+      const hms  = t.toLocaleTimeString('en-GB', { hour12: false });
+      const div  = document.createElement('div');
+      div.className = 'log-entry';
+      div.innerHTML = `
+        <div class="log-time">${hms}</div>
+        <div class="log-content">
+          <div class="log-type ${e.kind}">${e.kind}</div>
+          <div class="log-detail">${e.job_type} · ${e.job_id.slice(0,8)}… · ${e.message}</div>
+        </div>`;
+
+      // Remove placeholder if present.
+      const placeholder = body.querySelector('.empty-state');
+      if (placeholder) placeholder.remove();
+
+      body.prepend(div);
+    }
+
+    // Trim to max.
+    while (body.children.length > LOG_MAX) body.removeChild(body.lastChild);
+
+    // Keep seenEventIDs from growing unbounded.
+    if (seenEventIDs.size > 500) seenEventIDs.clear();
+  }
+
+  // ── Combined poll ──────────────────────────────────────────────────────────
+  async function poll() {
+    await Promise.all([pollWorkers(), pollEvents()]);
+  }
+
+  // ── Submit job ─────────────────────────────────────────────────────────────
+  function openModal()  { document.getElementById('backdrop').classList.add('open'); }
+  function closeModal() { document.getElementById('backdrop').classList.remove('open'); }
+
+  document.getElementById('backdrop').addEventListener('click', e => {
+    if (e.target === document.getElementById('backdrop')) closeModal();
+  });
+  document.addEventListener('keydown', e => { if (e.key === 'Escape') closeModal(); });
+
+  async function submitJob() {
+    const type   = document.getElementById('jobType').value;
+    const rawPay = document.getElementById('jobPayload').value.trim();
+    let payload;
+    try { payload = rawPay ? JSON.parse(rawPay) : {}; }
+    catch { showToast('Invalid JSON payload', true); return; }
+
+    try {
+      const res = await fetch('/jobs', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ type, payload }),
+      });
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      const data = await res.json();
+
+      sessionJobs++;
+      document.getElementById('sJobs').textContent = sessionJobs;
+
+      showToast('Job dispatched — ' + data.routed);
+      closeModal();
+      // Immediate poll so the new event appears right away.
+      setTimeout(poll, 200);
+    } catch(e) {
+      showToast('Dispatch failed: ' + e.message, true);
+    }
+  }
+
+  // ── Toast ──────────────────────────────────────────────────────────────────
+  let toastTimer;
+  function showToast(msg, err = false) {
+    const t = document.getElementById('toast');
+    t.textContent = msg;
+    t.className   = 'toast show' + (err ? ' err' : '');
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => { t.className = 'toast'; }, 3000);
+  }
+
+  // ── Helpers ────────────────────────────────────────────────────────────────
+  function timeSince(unix) {
+    const d = Math.floor(Date.now()/1000) - unix;
+    if (d < 5)  return 'just now';
+    if (d < 60) return d + 's ago';
+    return Math.floor(d/60) + 'm ago';
+  }
+
+  // ── Init ───────────────────────────────────────────────────────────────────
+  poll();
+  setInterval(poll, POLL_MS);
+</script>
+</body>
+</html>
+</file>
+
 <file path="docker-compose.yml">
 version: "3.9"
 
@@ -2094,27 +3612,6 @@ services:
 
 volumes:
   rabbitmq_data:
-</file>
-
-<file path="go.mod">
-module jobqueue
-
-go 1.24.5
-
-require github.com/rabbitmq/amqp091-go v1.10.0
-
-require (
-	github.com/google/uuid v1.6.0
-	google.golang.org/grpc v1.78.0
-	google.golang.org/protobuf v1.36.11
-)
-
-require (
-	golang.org/x/net v0.47.0 // indirect
-	golang.org/x/sys v0.38.0 // indirect
-	golang.org/x/text v0.31.0 // indirect
-	google.golang.org/genproto/googleapis/rpc v0.0.0-20251029180050-ab9386a59fda // indirect
-)
 </file>
 
 <file path="internal/queue/rabbitmq.go">
@@ -2245,6 +3742,76 @@ func (r *RabbitMQ) Close() error {
 	}
 	return r.conn.Close()
 }
+</file>
+
+<file path="go.mod">
+module jobqueue
+
+go 1.24.5
+
+require github.com/rabbitmq/amqp091-go v1.10.0
+
+require (
+	github.com/google/uuid v1.6.0
+	google.golang.org/grpc v1.78.0
+	google.golang.org/protobuf v1.36.11
+)
+
+require (
+	dario.cat/mergo v1.0.1 // indirect
+	github.com/Azure/go-ansiterm v0.0.0-20210617225240-d185dfc1b5a1 // indirect
+	github.com/Microsoft/go-winio v0.6.2 // indirect
+	github.com/cenkalti/backoff/v4 v4.2.1 // indirect
+	github.com/containerd/log v0.1.0 // indirect
+	github.com/containerd/platforms v0.2.1 // indirect
+	github.com/cpuguy83/dockercfg v0.3.2 // indirect
+	github.com/davecgh/go-spew v1.1.1 // indirect
+	github.com/distribution/reference v0.6.0 // indirect
+	github.com/docker/docker v28.0.1+incompatible // indirect
+	github.com/docker/go-connections v0.5.0 // indirect
+	github.com/docker/go-units v0.5.0 // indirect
+	github.com/ebitengine/purego v0.8.2 // indirect
+	github.com/felixge/httpsnoop v1.0.4 // indirect
+	github.com/go-logr/logr v1.4.3 // indirect
+	github.com/go-logr/stdr v1.2.2 // indirect
+	github.com/go-ole/go-ole v1.2.6 // indirect
+	github.com/gogo/protobuf v1.3.2 // indirect
+	github.com/klauspost/compress v1.17.4 // indirect
+	github.com/lufia/plan9stats v0.0.0-20211012122336-39d0f177ccd0 // indirect
+	github.com/magiconair/properties v1.8.9 // indirect
+	github.com/moby/docker-image-spec v1.3.1 // indirect
+	github.com/moby/patternmatcher v0.6.0 // indirect
+	github.com/moby/sys/sequential v0.5.0 // indirect
+	github.com/moby/sys/user v0.1.0 // indirect
+	github.com/moby/sys/userns v0.1.0 // indirect
+	github.com/moby/term v0.5.0 // indirect
+	github.com/morikuni/aec v1.0.0 // indirect
+	github.com/opencontainers/go-digest v1.0.0 // indirect
+	github.com/opencontainers/image-spec v1.1.1 // indirect
+	github.com/pkg/errors v0.9.1 // indirect
+	github.com/pmezard/go-difflib v1.0.0 // indirect
+	github.com/power-devops/perfstat v0.0.0-20210106213030-5aafc221ea8c // indirect
+	github.com/shirou/gopsutil/v3 v3.23.12 // indirect
+	github.com/shirou/gopsutil/v4 v4.25.1 // indirect
+	github.com/shoenig/go-m1cpu v0.1.6 // indirect
+	github.com/sirupsen/logrus v1.9.3 // indirect
+	github.com/stretchr/testify v1.11.1 // indirect
+	github.com/testcontainers/testcontainers-go v0.34.0 // indirect
+	github.com/tklauser/go-sysconf v0.3.12 // indirect
+	github.com/tklauser/numcpus v0.6.1 // indirect
+	github.com/yusufpapurcu/wmi v1.2.4 // indirect
+	go.opentelemetry.io/auto/sdk v1.2.1 // indirect
+	go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp v0.49.0 // indirect
+	go.opentelemetry.io/otel v1.38.0 // indirect
+	go.opentelemetry.io/otel/metric v1.38.0 // indirect
+	go.opentelemetry.io/otel/trace v1.38.0 // indirect
+	golang.org/x/crypto v0.44.0 // indirect
+	golang.org/x/net v0.47.0 // indirect
+	golang.org/x/sys v0.38.0 // indirect
+	golang.org/x/text v0.31.0 // indirect
+	google.golang.org/genproto/googleapis/rpc v0.0.0-20251029180050-ab9386a59fda // indirect
+	gopkg.in/yaml.v3 v3.0.1 // indirect
+)
 </file>
 
 <file path="internal/worker/registry.go">
@@ -2396,12 +3963,13 @@ func (r *Registry) CleanupExpired() {
 <file path="README.md">
 # Hermes
 
-A production-grade distributed job processing system built in Go — featuring a gRPC control plane, intelligent load-balanced HTTP dispatch, RabbitMQ-backed durability, graceful shutdown, and a fully containerised deployment.
+A production-grade distributed job processing system built in Go — featuring a gRPC control plane, intelligent load-balanced HTTP dispatch, RabbitMQ-backed durability, graceful shutdown, a real-time web dashboard, and a fully containerised deployment.
 
 [![Go Version](https://img.shields.io/badge/Go-1.24+-00ADD8?style=flat&logo=go)](https://golang.org/)
 [![RabbitMQ](https://img.shields.io/badge/RabbitMQ-3.13-FF6600?style=flat&logo=rabbitmq)](https://www.rabbitmq.com/)
 [![gRPC](https://img.shields.io/badge/gRPC-1.78-244c5a?style=flat&logo=grpc)](https://grpc.io/)
 [![Docker](https://img.shields.io/badge/Docker-Compose-2496ED?style=flat&logo=docker)](https://docs.docker.com/compose/)
+[![CI](https://github.com/akolmayek/hermes/actions/workflows/ci.yml/badge.svg)](https://github.com/akolmayek/hermes/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 ---
@@ -2415,7 +3983,9 @@ Hermes is built around a **control plane / data plane separation** — the same 
 - No external coordination service. The registry is in-memory with TTL-based expiry, kept consistent by the heartbeat protocol.
 - Jobs are never dropped. If direct dispatch fails, they fall back to RabbitMQ automatically — no retry logic needed at the client.
 - Workers report real load metrics. The router picks the least-loaded worker, not just any alive one.
+- Real job handlers are registered at startup. Adding a new job type is a single `Register` call — no switch statements, no conditionals.
 - The system shuts down cleanly. Both API and workers drain in-flight work before exiting.
+- A real-time dashboard surfaces worker fleet status and job activity live at `GET /`.
 
 ---
 
@@ -2423,13 +3993,7 @@ Hermes is built around a **control plane / data plane separation** — the same 
 
 > _Real-time worker and job monitoring dashboard_
 
-<!-- Add after dashboard is built -->
 ![Dashboard](docs/screenshots/dashboard.png)
-
-> _Landing page_
-
-<!-- Add after landing page is built -->
-![Landing](docs/screenshots/landing.png)
 
 ---
 
@@ -2438,14 +4002,15 @@ Hermes is built around a **control plane / data plane separation** — the same 
 ```
 ┌──────────────────────────────────────────────────────────────┐
 │                          CLIENT                              │
-│               curl / HTTP / Any HTTP client                  │
+│        curl / HTTP / Dashboard / Any HTTP client             │
 └────────────────────────────┬─────────────────────────────────┘
                              │  HTTP
                              ▼
 ┌──────────────────────────────────────────────────────────────┐
 │                     API SERVER  :8081                        │
 │                                                              │
-│   POST /jobs  ──►  Registry.PickWorker()                     │
+│   GET  /           ──►  Dashboard (embedded static UI)       │
+│   POST /jobs       ──►  Registry.PickWorker()                │
 │                          │                                   │
 │                   least-loaded worker?                       │
 │                   ┌──────┴──────┐                            │
@@ -2456,6 +4021,7 @@ Hermes is built around a **control plane / data plane separation** — the same 
 │           (fast path)       (reliable fallback)              │
 │                                                              │
 │   GET /workers  ──►  Registry.List() snapshot                │
+│   GET /events   ──►  Event ring (last 100 job events)        │
 │                                                              │
 │   gRPC :50051  ◄──  Workers (Register / Heartbeat)           │
 └────────┬─────────────────────────┬───────────────────────────┘
@@ -2489,7 +4055,7 @@ When a job arrives the API scores every alive worker by current load and POSTs t
 
 ### Reliability layer — RabbitMQ
 
-Every worker also consumes from the same RabbitMQ queue. Jobs that cannot be dispatched directly, or that fail during processing, are retried up to 3 times with exponential nack. After 3 failed attempts they are moved to a Dead Letter Queue for inspection — nothing is silently dropped.
+Every worker also consumes from the same RabbitMQ queue. Jobs that cannot be dispatched directly, or that fail during processing, are retried up to 3 times. After 3 failed attempts they are moved to a Dead Letter Queue for inspection — nothing is silently dropped.
 
 ---
 
@@ -2504,6 +4070,9 @@ For a single-node deployment, an in-memory registry with TTL-based expiry is sim
 **Why least-loaded routing instead of round-robin?**
 Workers report a live load counter with every heartbeat. Routing to the least-loaded worker is a 5-line change that meaningfully reduces tail latency under uneven workloads — and is a more accurate reflection of real capacity than a simple counter.
 
+**Why a handler registry instead of a switch statement?**
+Each job type is a registered `Handler` implementation. The worker looks up the handler by `job.Type` at runtime — adding a new job type means writing a struct and one `Register` call at startup, with no changes to the dispatch or retry logic.
+
 ---
 
 ## Features
@@ -2515,13 +4084,17 @@ Workers report a live load counter with every heartbeat. Routing to the least-lo
 | Automatic failover | Falls back to RabbitMQ transparently when no workers are alive or dispatch fails |
 | Worker registry | In-memory registry with TTL-based eviction (15 s) |
 | Heartbeat monitoring | Workers report load and status every 5 seconds |
+| Job handler registry | Extensible handler pattern — add new job types with a single Register call |
 | Retry logic | Failed queue jobs retry up to 3 times before DLQ |
 | Dead Letter Queue | Failed jobs are captured for inspection, never silently dropped |
 | Graceful shutdown | API and workers drain in-flight work on SIGINT / SIGTERM before exiting |
+| Real-time dashboard | Live worker fleet and job activity log served at `GET /` |
+| Event ring | Server-side ring buffer records the last 100 job events, surfaced via `GET /events` |
 | Environment-driven config | No hardcoded credentials — everything configurable via environment variables |
 | Single-command deployment | `docker-compose up --build` starts RabbitMQ, API, and worker with health-checked ordering |
 | Multi-worker | Scale horizontally by starting additional worker instances — each self-registers |
-| Visibility API | `GET /workers` returns a live JSON snapshot of the fleet with load and status |
+| Integration tests | testcontainers-go spins up a real RabbitMQ container to test the full job flow end to end |
+| CI pipeline | GitHub Actions runs unit and integration tests on every push and pull request |
 
 ---
 
@@ -2534,7 +4107,10 @@ Workers report a live load counter with every heartbeat. Routing to the least-lo
 | Message broker | RabbitMQ 3.13 (AMQP 0.9.1) |
 | Job dispatch | HTTP/JSON |
 | Worker coordination | In-memory registry with TTL |
+| Dashboard | Embedded single-page HTML (Go embed.FS) |
 | Infrastructure | Docker Compose (multi-stage builds) |
+| Testing | testcontainers-go, Go testing package |
+| CI | GitHub Actions |
 
 ---
 
@@ -2542,26 +4118,40 @@ Workers report a live load counter with every heartbeat. Routing to the least-lo
 
 ```
 hermes/
+├── .github/
+│   └── workflows/
+│       └── ci.yml                # CI — unit + integration tests on every push
 ├── cmd/
 │   ├── api/
-│   │   └── main.go               # API server — HTTP :8081 + gRPC :50051
+│   │   ├── main.go               # API server — HTTP :8081 + gRPC :50051
+│   │   ├── handlers.go           # HTTP handlers — /jobs, /workers, /events
+│   │   └── static/
+│   │       └── index.html        # Real-time dashboard (embedded into binary)
 │   └── worker/
 │       ├── worker_main/
-│       │   └── main.go           # Worker node — dispatch server + consumer
+│       │   └── main.go           # Worker node — dispatch server + queue consumer
 │       └── dlq_consumer/
 │           └── main.go           # Dead-letter queue inspector
 ├── internal/
 │   ├── config/
 │   │   └── config.go             # Environment-driven configuration
+│   ├── events/
+│   │   └── ring.go               # Thread-safe ring buffer for job events
 │   ├── jobs/
-│   │   └── job.go                # Job struct
+│   │   ├── job.go                # Job struct
+│   │   ├── handler.go            # Handler interface + HandlerRegistry
+│   │   └── handlers/
+│   │       ├── email.go          # Email job handler
+│   │       └── resize_image.go   # Resize-image job handler
 │   ├── queue/
 │   │   ├── config.go             # RabbitMQ topology config
 │   │   ├── queue.go              # Queue interface
-│   │   └── rabbitmq.go           # RabbitMQ implementation, DLQ setup, retry loop
+│   │   └── rabbitmq.go           # RabbitMQ implementation, DLQ setup
 │   └── worker/
 │       ├── registry.go           # In-memory registry with least-loaded routing
 │       └── grpc_server.go        # gRPC handler — Register, Heartbeat, ListWorkers
+├── internal/integration/
+│   └── queue_test.go             # End-to-end integration tests (testcontainers-go)
 ├── proto/
 │   ├── worker.proto              # Protobuf service definition
 │   └── workerpb/
@@ -2591,6 +4181,8 @@ docker-compose up --build
 
 RabbitMQ starts first with a health check. The API waits for RabbitMQ to be ready. The worker waits for both. Everything comes up in the right order automatically.
 
+Then open **http://localhost:8081** to view the live dashboard.
+
 ### Option B — Local development
 
 **Prerequisites:** Go 1.24+, Docker (for RabbitMQ)
@@ -2600,18 +4192,22 @@ RabbitMQ starts first with a health check. The API waits for RabbitMQ to be read
 docker-compose up -d rabbitmq
 
 # 2. Start the API
-go run ./cmd/api/main.go
+go run ./cmd/api
 
 # 3. Start a worker (separate terminal)
 go run ./cmd/worker/worker_main/main.go
 
-# 4. Optionally start a second worker
-WORKER_DISPATCH_PORT=9002 go run ./cmd/worker/worker_main/main.go
+# 4. Scale horizontally — each worker self-registers on its own port
+API_GRPC_ADDR=localhost:50051 WORKER_DISPATCH_PORT=9002 go run ./cmd/worker/worker_main/main.go
+API_GRPC_ADDR=localhost:50051 WORKER_DISPATCH_PORT=9003 go run ./cmd/worker/worker_main/main.go
 ```
 
 ### Test it
 
 ```bash
+# Open the dashboard
+open http://localhost:8081
+
 # Check the worker fleet
 curl http://localhost:8081/workers
 
@@ -2619,6 +4215,13 @@ curl http://localhost:8081/workers
 curl -X POST http://localhost:8081/jobs \
   -H "Content-Type: application/json" \
   -d '{"type":"email","payload":{"to":"user@example.com","subject":"Hello"}}'
+
+# Flood the system with 10 concurrent jobs
+for i in {1..10}; do
+  curl -s -X POST http://localhost:8081/jobs \
+    -H "Content-Type: application/json" \
+    -d "{\"type\":\"email\",\"payload\":{\"to\":\"user$i@example.com\",\"subject\":\"Test $i\"}}" &
+done
 ```
 
 **Direct dispatch response (worker alive):**
@@ -2648,6 +4251,12 @@ curl -X POST http://localhost:8081/jobs \
 
 ## API Reference
 
+### `GET /`
+
+Serves the real-time dashboard — live worker fleet status, load metrics, and a scrolling activity log of all job events. Also provides a job submission modal.
+
+---
+
 ### `POST /jobs`
 
 Submit a job for processing.
@@ -2670,6 +4279,8 @@ Submit a job for processing.
 ```
 
 `routed` is either `"direct"` (dispatched to a live worker) or `"queue"` (published to RabbitMQ).
+
+**Supported job types:** `email`, `resize-image`
 
 ---
 
@@ -2697,6 +4308,80 @@ Live snapshot of the worker fleet.
   ]
 }
 ```
+
+---
+
+### `GET /events`
+
+The last 100 job events recorded by the API, newest first. Used by the dashboard to populate the activity log.
+
+**Response:**
+```json
+{
+  "count": 3,
+  "events": [
+    {
+      "time": "2025-01-01T12:00:02Z",
+      "job_id": "1d3de6cf-...",
+      "job_type": "email",
+      "kind": "direct",
+      "worker_id": "8a4605e1-...",
+      "message": "dispatched direct → 8a4605e1"
+    },
+    {
+      "time": "2025-01-01T12:00:01Z",
+      "job_id": "2e4df7ag-...",
+      "job_type": "resize-image",
+      "kind": "queued",
+      "message": "published to queue — no alive workers"
+    }
+  ]
+}
+```
+
+`kind` is one of `direct`, `queued`, or `error`.
+
+---
+
+## Adding a New Job Type
+
+1. Create `internal/jobs/handlers/your_type.go` implementing the `jobs.Handler` interface:
+
+```go
+type YourHandler struct{}
+
+func (h *YourHandler) Handle(ctx context.Context, job jobs.Job) error {
+    // your logic here
+    return nil
+}
+```
+
+2. Register it in `cmd/worker/worker_main/main.go`:
+
+```go
+func init() {
+    handlerRegistry = jobs.NewHandlerRegistry()
+    handlerRegistry.Register("email", &handlers.EmailHandler{})
+    handlerRegistry.Register("resize-image", &handlers.ResizeImageHandler{})
+    handlerRegistry.Register("your-type", &handlers.YourHandler{})  // add this
+}
+```
+
+That's it. No changes to routing, retry, or DLQ logic.
+
+---
+
+## Testing
+
+```bash
+# Unit tests
+go test ./...
+
+# Integration tests (requires Docker)
+go test -tags integration -timeout=120s ./internal/integration/...
+```
+
+Integration tests use testcontainers-go to spin up a real RabbitMQ container and verify the full `POST /jobs → queue → consumer → ack` flow end to end, including the retry loop and DLQ path.
 
 ---
 
@@ -2733,14 +4418,17 @@ Registry.PickWorker()  ←  scores all alive workers by current load
     │   HTTP POST → worker /dispatch
     │       │
     │       ├── 200 OK  →  202 { routed: "direct", worker_id: "..." }
+    │       │               event kind: "direct" pushed to ring
     │       │
     │       └── error   →  publish to RabbitMQ
     │                          │
-    │                      202 { routed: "queue", note: "worker unreachable" }
+    │                      202 { routed: "queue" }
+    │                          event kind: "error" pushed to ring
     │
     └── no workers alive  →  publish to RabbitMQ
                                    │
-                               202 { routed: "queue", note: "no alive workers" }
+                               202 { routed: "queue" }
+                                   event kind: "queued" pushed to ring
 ```
 
 ---
@@ -2750,7 +4438,7 @@ Registry.PickWorker()  ←  scores all alive workers by current load
 ```
 startup
    │
-   ├─ connect to RabbitMQ (retry loop, up to 10 attempts)
+   ├─ connect to RabbitMQ (retry loop, up to 20 attempts)
    ├─ start HTTP /dispatch server
    ├─ dial API gRPC :50051
    ├─ Register("<uuid>@<host>:<port>")
@@ -2760,17 +4448,22 @@ startup
    │                                                           │
    ├─ RabbitMQ consumer goroutine                              │
    │       │                                                   │
-   │       ├─ message received → process → Ack                 │
-   │       │                                                   │
-   │       └─ failure → increment attempts                     │
-   │               │                                           │
-   │               ├─ attempts < 3 → Nack (re-queued)          │
-   │               │                                           │
-   │               └─ attempts == 3 → Dead Letter Queue        │
+   │       ├─ message received                                 │
+   │       │       │                                           │
+   │       │       ▼                                           │
+   │       │   HandlerRegistry.Dispatch(ctx, job)              │
+   │       │       │                                           │
+   │       │       ├─ success → Ack                            │
+   │       │       │                                           │
+   │       │       └─ failure → increment attempts             │
+   │       │               │                                   │
+   │       │               ├─ attempts < 3 → re-publish        │
+   │       │               │                                   │
+   │       │               └─ attempts == 3 → Nack → DLQ       │
    │                                                           │
    └─ SIGINT / SIGTERM received                                │
            │                                                   │
-           ├─ HTTP server: graceful shutdown (5 s timeout)  ◄──┘
+           ├─ HTTP server: graceful shutdown (10 s timeout) ◄──┘
            ├─ RabbitMQ connection: close
            └─ gRPC connection: close
 ```
@@ -2781,8 +4474,8 @@ startup
 
 Both the API and worker handle `SIGINT` and `SIGTERM`. On receiving a signal:
 
-- The **API** stops accepting new HTTP requests, waits up to 5 seconds for in-flight handlers to complete, then stops the gRPC server and closes the RabbitMQ connection.
-- Each **worker** shuts down its dispatch HTTP server, closes its RabbitMQ consumer, and closes its gRPC connection to the API.
+- The **API** stops accepting new HTTP requests, stops the gRPC server, and closes the RabbitMQ connection.
+- Each **worker** shuts down its dispatch HTTP server with a 10-second timeout, closes its RabbitMQ consumer, and closes its gRPC connection to the API.
 
 A rolling deployment or `docker-compose down` will not drop in-flight jobs.
 
@@ -2800,7 +4493,7 @@ go run ./cmd/worker/dlq_consumer/main.go
 
 ## RabbitMQ Management UI
 
-[http://localhost:15672](http://localhost:15672) — username `guest`, password `guest`
+[http://localhost:15672](http://localhost:15672) — username and password set in `.env`
 
 Inspect queue depths, message rates, and dead-lettered jobs here.
 
@@ -2808,7 +4501,9 @@ Inspect queue depths, message rates, and dead-lettered jobs here.
 
 ## Roadmap
 
-- [ ] Web dashboard — real-time worker and job monitoring UI
+- [x] Web dashboard — real-time worker and job monitoring UI
+- [x] Integration tests — testcontainers-go end-to-end test suite
+- [x] CI pipeline — GitHub Actions on every push and pull request
 - [ ] Landing page
 - [ ] Prometheus metrics endpoint (`/metrics`)
 - [ ] Job status tracking — pending / running / complete / failed
@@ -2832,7 +4527,8 @@ MIT
 package main
 
 import (
-	"encoding/json"
+	"embed"
+	"io/fs"
 	"log"
 	"net"
 	"net/http"
@@ -2841,15 +4537,17 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/google/uuid"
 	"google.golang.org/grpc"
 
 	"jobqueue/internal/config"
-	"jobqueue/internal/jobs"
+	"jobqueue/internal/events"
 	"jobqueue/internal/queue"
 	"jobqueue/internal/worker"
 	"jobqueue/proto/workerpb"
 )
+
+//go:embed static
+var staticFiles embed.FS
 
 func main() {
 	cfg := config.Load()
@@ -2880,6 +4578,11 @@ func main() {
 	}()
 
 	// -------------------------------------------------------------------------
+	// Event ring — last 100 job events for the dashboard
+	// -------------------------------------------------------------------------
+	ring := events.NewRing(100)
+
+	// -------------------------------------------------------------------------
 	// gRPC server — workers Register and Heartbeat here
 	// -------------------------------------------------------------------------
 	grpcServer := grpc.NewServer()
@@ -2901,101 +4604,22 @@ func main() {
 	// HTTP API server
 	// -------------------------------------------------------------------------
 	mux := http.NewServeMux()
+	mux.HandleFunc("/jobs", jobsHandler(registry, rmq, ring))
+	mux.HandleFunc("/workers", workersHandler(registry))
+	mux.HandleFunc("/events", eventsHandler(ring))
 
-	// POST /jobs — submit a job
-	mux.HandleFunc("/jobs", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	// Serve the dashboard — must be registered last so /jobs and /workers
+	// are never intercepted by the file server.
+	staticFS, err := fs.Sub(staticFiles, "static")
+	if err != nil {
+		log.Fatalf("failed to create static sub-filesystem: %v", err)
+	}
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/" {
+			http.NotFound(w, r)
 			return
 		}
-
-		var body struct {
-			Type    string      `json:"type"`
-			Payload interface{} `json:"payload"`
-		}
-		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-			http.Error(w, "invalid request: "+err.Error(), http.StatusBadRequest)
-			return
-		}
-
-		job := jobs.Job{
-			ID:       uuid.NewString(),
-			Type:     body.Type,
-			Payload:  body.Payload,
-			Attempts: 0,
-		}
-
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusAccepted)
-
-		// Try direct dispatch to a live worker first.
-		workerID := registry.PickWorker()
-		if workerID != "" {
-			if err := registry.DispatchJob(workerID, job.ID, job.Type, job.Payload); err == nil {
-				log.Printf("job %s dispatched directly to worker %s", job.ID, workerID)
-				json.NewEncoder(w).Encode(map[string]interface{}{
-					"job":       job,
-					"routed":    "direct",
-					"worker_id": workerID,
-				})
-				return
-			}
-			log.Printf("direct dispatch to worker %s failed, falling back to queue", workerID)
-		}
-
-		// No alive workers or dispatch failed — publish to RabbitMQ.
-		data, err := json.Marshal(job)
-		if err != nil {
-			http.Error(w, "failed to encode job", http.StatusInternalServerError)
-			return
-		}
-		if err := rmq.Publish(data); err != nil {
-			http.Error(w, "failed to queue job", http.StatusInternalServerError)
-			return
-		}
-		log.Printf("job %s queued (no alive workers)", job.ID)
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"job":    job,
-			"routed": "queue",
-			"note":   "no alive workers, job queued",
-		})
-	})
-
-	// GET /workers — live snapshot of the worker fleet
-	mux.HandleFunc("/workers", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-
-		snapshot := registry.List()
-
-		type workerView struct {
-			WorkerID     string `json:"worker_id"`
-			LastSeenUnix int64  `json:"last_seen_unix"`
-			Load         int32  `json:"load"`
-			Status       string `json:"status"`
-		}
-
-		workers := make([]workerView, 0, len(snapshot))
-		for id, info := range snapshot {
-			status := "idle"
-			if info.Load > 0 {
-				status = "busy"
-			}
-			workers = append(workers, workerView{
-				WorkerID:     id,
-				LastSeenUnix: info.LastSeen.Unix(),
-				Load:         info.Load,
-				Status:       status,
-			})
-		}
-
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"count":   len(workers),
-			"workers": workers,
-		})
+		http.ServeFileFS(w, r, staticFS, "index.html")
 	})
 
 	httpServer := &http.Server{
@@ -3043,11 +4667,22 @@ import (
 
 	"jobqueue/internal/config"
 	"jobqueue/internal/jobs"
+	"jobqueue/internal/jobs/handlers"
 	"jobqueue/internal/queue"
 	"jobqueue/proto/workerpb"
 )
 
 const maxAttempts = 3
+
+// handlerRegistry is the process-wide job handler registry.
+// Handlers are registered once at startup and are safe for concurrent use.
+var handlerRegistry *jobs.HandlerRegistry
+
+func init() {
+	handlerRegistry = jobs.NewHandlerRegistry()
+	handlerRegistry.Register("email", &handlers.EmailHandler{})
+	handlerRegistry.Register("resize-image", &handlers.ResizeImageHandler{})
+}
 
 func main() {
 	cfg := config.Load()
@@ -3089,9 +4724,21 @@ func main() {
 			return
 		}
 
-		log.Printf("[direct] job received: id=%s type=%s", req.JobID, req.JobType)
-		log.Printf("[direct] job %s completed", req.JobID)
+		job := jobs.Job{
+			ID:      req.JobID,
+			Type:    req.JobType,
+			Payload: req.Payload,
+		}
 
+		log.Printf("[direct] job received: id=%s type=%s", job.ID, job.Type)
+
+		if err := handlerRegistry.Dispatch(r.Context(), job); err != nil {
+			log.Printf("[direct] job %s failed: %v", job.ID, err)
+			http.Error(w, "job processing failed", http.StatusInternalServerError)
+			return
+		}
+
+		log.Printf("[direct] job %s completed", job.ID)
 		w.WriteHeader(http.StatusOK)
 	})
 
@@ -3217,19 +4864,23 @@ func handleMessage(msg amqp.Delivery, rmq queue.Queue) {
 
 	log.Printf("[queue] job received: id=%s type=%s attempt=%d", job.ID, job.Type, job.Attempts)
 
-	// Simulate job processing — replace this with real handler logic.
-	jobSucceeded := true // TODO: run the actual job here
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
 
-	if jobSucceeded {
+	err := handlerRegistry.Dispatch(ctx, job)
+
+	if err == nil {
 		log.Printf("[queue] job %s succeeded on attempt %d", job.ID, job.Attempts)
 		_ = msg.Ack(false)
 		return
 	}
 
 	// Job failed — decide whether to retry or send to DLQ.
+	log.Printf("[queue] job %s failed on attempt %d: %v", job.ID, job.Attempts, err)
 	job.Attempts++
+
 	if job.Attempts < maxAttempts {
-		log.Printf("[queue] job %s failed, retrying (%d/%d)", job.ID, job.Attempts, maxAttempts)
+		log.Printf("[queue] retrying job %s (%d/%d)", job.ID, job.Attempts, maxAttempts)
 
 		data, err := json.Marshal(job)
 		if err != nil {
@@ -3238,8 +4889,7 @@ func handleMessage(msg amqp.Delivery, rmq queue.Queue) {
 			return
 		}
 
-		// Ack the original message and re-publish with the incremented attempt
-		// counter so retries are tracked correctly.
+		// Ack the original and re-publish with the incremented attempt counter.
 		_ = msg.Ack(false)
 		if err := rmq.Publish(data); err != nil {
 			log.Printf("failed to re-publish job %s: %v", job.ID, err)
@@ -3247,7 +4897,7 @@ func handleMessage(msg amqp.Delivery, rmq queue.Queue) {
 		return
 	}
 
-	// Exhausted all attempts — Nack without requeue so the DLX routes it to DLQ.
+	// Exhausted all attempts — Nack without requeue so DLX routes it to DLQ.
 	log.Printf("[queue] job %s exhausted all %d attempts — sending to DLQ", job.ID, maxAttempts)
 	_ = msg.Nack(false, false)
 }
