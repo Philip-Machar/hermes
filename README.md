@@ -30,7 +30,7 @@ Hermes is built around a **control plane / data plane separation** — the same 
 
 > _Real-time worker and job monitoring dashboard_
 
-![Dashboard](docs/screenshots/dashboard.png)
+![Dashboard](docs/screenshots/hermes5.png)
 
 ---
 
